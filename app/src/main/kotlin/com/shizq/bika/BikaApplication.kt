@@ -9,6 +9,7 @@ import android.util.Log
 import coil3.ImageLoader
 import coil3.PlatformContext
 import coil3.SingletonImageLoader
+import com.shizq.bika.core.common.BikaLog
 import com.shizq.bika.core.download.Download
 import com.shizq.bika.core.logging.LoggingConfigurator
 import com.shizq.bika.core.network.dns.DnsAutoSelector
@@ -35,6 +36,9 @@ class BikaApplication : Application(), SingletonImageLoader.Factory {
     override fun onCreate() {
         super.onCreate()
         initializeLogging()
+        // 异常处理器在 onCreate 里就装上了，晚于 MainActivity 才初始化 BikaLog 的话，
+        // 启动阶段的崩溃会无处可写。先在这里兜一次底（init 幂等，MainActivity 再调无副作用）
+        BikaLog.init(this, enabled = false)
 //        setStrictModePolicy()
         Sync.initialize(this)
         Download.initialize(this)
@@ -93,6 +97,10 @@ class BikaApplication : Application(), SingletonImageLoader.Factory {
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             try {
+                // 两条路都记：log4j 那份给完整的上下文，BikaLog 这份是同步落盘，
+                // 不依赖异步 appender 是否在进程被杀前写完。设置页的
+                // 「查看 / 导出系统日志」读的就是后者所在目录
+                BikaLog.logFatalException(thread.name, throwable)
                 logger.error(throwable) {
                     "FATAL EXCEPTION on thread: ${thread.name}"
                 }
