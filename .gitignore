@@ -6,6 +6,9 @@
 *.ap_
 *.aab
 
+# 例外：release/ 下是随仓库一起分发的成品包（构建产物默认忽略，这里刻意保留）
+!release/*.apk
+
 # Files for the ART/Dalvik VM
 *.dex
 
