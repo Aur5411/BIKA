@@ -18,7 +18,7 @@
 `1.11.23`（versionCode 73）· `com.shizq.bika` · 官方发布证书签名（`CN=shizq`），
 可与官方版本互相覆盖安装。
 
-成品在本仓库 `release/` 下：`arm64-v8a`（多数设备）/ `armeabi-v7a`（老设备）。
+成品包见下方「下载」。
 
 ## 新增与改动
 
@@ -44,14 +44,15 @@
 **其它** 修复下载完成后进度不置 100；修复阅读进度防抖写入会把进度写退；详情页标签改惰性列表；
 补齐多个模块缺失的测试依赖，416 项单元测试全部通过。
 
-## 自己编译
+## 下载
 
-```bash
-./gradlew :app:assembleRelease -PminifyWithR8=false
-```
+编译好的成品放在 **Releases** 页面：
 
-根目录另有 `build.bat` / `build.sh` 便捷脚本。
+**https://github.com/Aur5411/BIKA/releases**
 
-> 别在构建沙箱隔离下打包——沙箱会拦截打包过程中的文件操作，产出缺 `AndroidManifest.xml`、
-> `resources.arsc`、整个 `res/` 的残缺 APK，且重复构建会得到 SHA256 完全相同的坏包，
-> 只看 `BUILD SUCCESSFUL` 发现不了。交付前建议校验条目数（本项目为 476）。
+| 文件 | 适用 |
+|---|---|
+| `BIKA_v1.11.23_arm64-v8a.apk` | 多数设备（推荐） |
+| `BIKA_v1.11.23_armeabi-v7a.apk` | 老设备 / 32 位 |
+
+仓库 `release/` 目录下也放了一份，内容相同。
