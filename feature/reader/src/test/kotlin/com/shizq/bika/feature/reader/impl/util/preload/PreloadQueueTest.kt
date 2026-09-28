@@ -144,6 +144,7 @@ class PreloadQueueTest {
         val started = mutableListOf<Int>()
         val queue = PreloadQueue(
             scope = backgroundScope,
+            maxConcurrent = 2,
             keyOf = { page: Int -> page },
             execute = { page ->
                 started += page
@@ -173,6 +174,7 @@ class PreloadQueueTest {
 
         val queue = PreloadQueue(
             scope = scope.backgroundScope,
+            maxConcurrent = 2,
             keyOf = { page: Int -> page },
             execute = { page ->
                 started += page

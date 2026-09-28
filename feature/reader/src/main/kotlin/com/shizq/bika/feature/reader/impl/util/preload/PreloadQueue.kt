@@ -11,11 +11,14 @@ import kotlinx.coroutines.launch
  * All calls and [scope] must use the same single-threaded dispatcher (the UI dispatcher).
  * [execute] 返回 true 表示预载成功；返回 false 表示失败。失败任务在当前窗口
  * 内不会忙重试，离开窗口后清除失败标记，重新进入时可以再次尝试。
-
+ *
+ * [maxConcurrent] 刻意不设默认值：它原先默认 2，而生产调用点没显式传参，
+ * 于是"预载只有 2 并发"这件事在任何地方都读不出来，只能翻源码才发现——
+ * 阅读页图慢有它一份。改成必填后，每个调用点都得写明自己要多少并发。
  */
 internal class PreloadQueue<K : Any, T : Any>(
     private val scope: CoroutineScope,
-    private val maxConcurrent: Int = 2,
+    private val maxConcurrent: Int,
     private val keyOf: (T) -> K,
     private val execute: suspend (T) -> Boolean,
 ) {

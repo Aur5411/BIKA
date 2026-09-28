@@ -44,6 +44,18 @@ data class PreloadRequest(
     val request: ImageRequest,
 )
 
+/**
+ * 预载并发数。
+ *
+ * 与图片客户端对同一域名的并发上限（见 NetworkModule 的
+ * `IMAGE_MAX_REQUESTS_PER_HOST`）留出余量：预载、当前可见页、进度条预览图
+ * 共用那一个额度，预载只该占其中一部分，否则会把"用户正在看的那一张"挤到后面。
+ *
+ * 取 4：足以持续把预载窗口喂满，同时给可见页留下大部分额度。原先是 2——
+ * 且因为 [PreloadQueue] 当时给了默认值、这里没传参，那个 2 是隐形的。
+ */
+private const val PRELOAD_CONCURRENCY = 4
+
 internal class CoilPreloadRequestEnqueuer(
     context: Context,
     scope: CoroutineScope,
@@ -52,6 +64,7 @@ internal class CoilPreloadRequestEnqueuer(
     private val imageLoader = context.imageLoader
     private val queue = PreloadQueue(
         scope = scope,
+        maxConcurrent = PRELOAD_CONCURRENCY,
         keyOf = PreloadRequest::key,
         execute = { preload ->
             try {

@@ -56,8 +56,17 @@ private const val IMAGE_CACHE_DIR_NAME = "image_cache"
 /** 图片磁盘缓存下限：小屏幕设备算出来太小时也要够存几十张原图。 */
 private const val MIN_IMAGE_DISK_CACHE_BYTES = 64L * 1024 * 1024
 
-/** 图片磁盘缓存上限：长漫画的原图能堆到几个 GB，必须封顶。 */
-private const val MAX_IMAGE_DISK_CACHE_BYTES = 512L * 1024 * 1024
+/**
+ * 图片磁盘缓存上限。
+ *
+ * 这是"回看已读章节要多久"的决定项：命中缓存的页直接读盘，不再走网络。
+ * 512MB 对长漫画偏紧——按单页原图 1~3MB 算只装得下几十话。提到 1GB 约翻倍，
+ * 代价是占更多存储（目录在 cacheDir，系统空间紧张时会被回收，属可接受的取舍）。
+ *
+ * 它**不影响首次阅读的速度**：首次翻页快慢由预载窗口 + 网络并发决定，
+ * 磁盘缓存只在回看已读页面时才命中。
+ */
+private const val MAX_IMAGE_DISK_CACHE_BYTES = 1024L * 1024 * 1024
 
 /**
  * API 域名的并发请求上限。
@@ -71,6 +80,24 @@ private const val MAX_REQUESTS_PER_HOST = 8
 
 /** 全局并发上限，保持 OkHttp 默认值，只在同域名上限之外再兜一层。 */
 private const val MAX_REQUESTS = 64
+
+/**
+ * 图片域名的并发请求上限——**阅读页图的真实天花板**。
+ *
+ * 章节图全部来自同一批存储域名（storage1.picacomic.com 等），而 OkHttp 按 host
+ * 计数，所以这里定多少，同一时刻就最多只有这么多张图在下载。
+ *
+ * 原先这里**根本没配**，走的是 OkHttp 默认值 5——比浏览器单域名默认（6）还保守。
+ * 阅读时"预载"和"当前可见页"共用这 5 个额度，翻页自然总在等。
+ *
+ * 取 12 的依据：图片是纯大文件下载，不像接口那样有"瞬时并发把服务端打挂"的风险，
+ * 单域名十几条连接在 CDN 侧完全正常；但也不宜再大——并发过高会让多张图争抢带宽，
+ * 反而拖慢"当前正在看的那一张"，也更容易触发服务端限流。
+ */
+private const val IMAGE_MAX_REQUESTS_PER_HOST = 12
+
+/** 图片全局并发上限，保持 OkHttp 默认 64。 */
+private const val IMAGE_MAX_REQUESTS = 64
 
 
 @Module
@@ -185,8 +212,17 @@ internal object NetworkModule {
         directDns: DirectDns,
     ): OkHttpClient = trace("ImageOkHttpClient") {
         OkHttpClient.Builder()
-            .connectionPool(ConnectionPool(20, 5, TimeUnit.MINUTES))
+            // 连接池与上面的并发上限匹配：idle 连接数少于同时在飞的请求数时，
+            // 多出来的请求每次都要重做握手（DNS→TCP→TLS），叠起来的延迟正是
+            // "翻页一顿一顿"的隐性来源。keepAlive 5 分钟覆盖单章阅读时长。
+            .connectionPool(ConnectionPool(IMAGE_MAX_REQUESTS_PER_HOST * 2, 5, TimeUnit.MINUTES))
             .dns(directDns)
+            .dispatcher(
+                Dispatcher().apply {
+                    maxRequests = IMAGE_MAX_REQUESTS
+                    maxRequestsPerHost = IMAGE_MAX_REQUESTS_PER_HOST
+                }
+            )
             .build()
     }
 
