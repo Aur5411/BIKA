@@ -135,16 +135,23 @@ class ChapterRepositoryImpl @Inject constructor(
 
                 walkEpisodePages(
                     comicId = comicId,
-                    onPage = { chapters, isLastPage ->
+                    onPage = { chapters, isLastPage, declaredTotal ->
                         collected += chapters
                         emittedAny = true
                         // isComplete 直接取"是否末页"：因页数上限或中途失败停下时
-                        // 这个值是 false，导航据此知道边界不可信
+                        // 这个值是 false，导航据此知道边界不可信。
+                        // declaredTotal 第一页就有，所以上下章导航从第一次发射起就可用，
+                        // 不用等整本目录拉完
                         emit(
                             ChapterCatalog(
                                 chapters = collected.sortedBy { it.order },
                                 isComplete = isLastPage,
+                                declaredTotal = declaredTotal,
                             )
+                                // 与目录页同一套补齐规则：服务端把长目录截断（160 话只给 90 话）时
+                                // 按 order 补出缺失的前置章节，阅读器的章节列表与上下章导航
+                                // 才和目录页看到的一致
+                                .fillMissingLeadingOrders(declaredTotal)
                         )
                     },
                     // 中途失败保留已拉到的部分：若由下游 catch 统一 emit(Empty)，
@@ -206,7 +213,7 @@ class ChapterRepositoryImpl @Inject constructor(
             expectedTotal = withTimeout(COMPLETE_CATALOG_TIMEOUT_MS) {
                 walkEpisodePages(
                     comicId = comicId,
-                    onPage = { chapters, isLastPage ->
+                    onPage = { chapters, isLastPage, _ ->
                         collected += chapters
                         complete = isLastPage
                         onProgress(collected.sortedBy { it.order })
@@ -234,6 +241,7 @@ class ChapterRepositoryImpl @Inject constructor(
         val fetched = ChapterCatalog(
             chapters = collected.sortedBy { it.order },
             isComplete = complete,
+            declaredTotal = expectedTotal,
         )
         // 服务端把长目录截断时（自报 160 话却只给 90 条），按 order 把缺失的前置章节补出来。
         // 只在推断无歧义时才补，理由见 fillMissingLeadingOrders 的文档
@@ -262,7 +270,7 @@ class ChapterRepositoryImpl @Inject constructor(
 
         walkEpisodePages(
             comicId = comicId,
-            onPage = { chapters, _ -> collected += chapters },
+            onPage = { chapters, _, _ -> collected += chapters },
             // 不吞异常：下载选择面板拿到残缺列表，用户会以为章节就这么多
             onPageError = { _, e -> throw e },
         )
@@ -310,8 +318,9 @@ class ChapterRepositoryImpl @Inject constructor(
      * 重试间隔带随机抖动：同一批请求往往同时失败，固定间隔会让它们同时重发，
      * 对着已经不稳的服务端再打一波同步流量。
      *
-     * @param onPage 第二个参数表示本页是否为末页。因页数上限或单页彻底失败而
-     *   提前终止时，最后一次回调收到的是 false
+     * @param onPage 第二个参数表示本页是否为末页；第三个参数是服务端自报的章节总数
+     *   （0 = 未知），上下章导航靠它判断"还有没有下一话"，因此它在第一页就可用、
+     *   不必等整本拉完。因页数上限或单页彻底失败而提前终止时，最后一次回调收到的是 false
      * @return 服务端自报的章节总数（各页 `total` 里的最大值）。0 表示服务端没给，
      *   调用方据此判断"还差多少"——[getCompleteChapterCatalog] 用它决定要不要补占位条目
      *
@@ -322,7 +331,7 @@ class ChapterRepositoryImpl @Inject constructor(
      */
     private suspend fun walkEpisodePages(
         comicId: String,
-        onPage: suspend (chapters: List<Chapter>, isLastPage: Boolean) -> Unit,
+        onPage: suspend (chapters: List<Chapter>, isLastPage: Boolean, declaredTotal: Int) -> Unit,
         onPageError: (page: Int, e: Throwable) -> Unit,
     ): Int {
         val deduplicator = CrossPageDeduplicator<Chapter> { it.id }
@@ -415,7 +424,7 @@ class ChapterRepositoryImpl @Inject constructor(
                     // 只把非空页记进 previousPageIds：空页会把基准清空，
                     // 使得后面真正被 clamp 的页无法再被识别出来
                     if (currentPageIds.isNotEmpty()) previousPageIds = currentPageIds
-                    onPage(chapters, false)
+                    onPage(chapters, false, expectedTotal)
                     continue
                 }
 
@@ -442,11 +451,11 @@ class ChapterRepositoryImpl @Inject constructor(
                                     "疑似服务端在无效页码上返回${if (isEmptyPage) "空页" else "重复页"}"
                         }
                     }
-                    onPage(chapters, confidentEnd)
+                    onPage(chapters, confidentEnd, expectedTotal)
                     return expectedTotal
                 }
 
-                onPage(chapters, false)
+                onPage(chapters, false, expectedTotal)
                 previousPageIds = currentPageIds
             }
 

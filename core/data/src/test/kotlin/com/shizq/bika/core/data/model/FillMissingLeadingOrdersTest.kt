@@ -33,7 +33,15 @@ class FillMissingLeadingOrdersTest {
 
         assertEquals(160, filled.chapters.size)
         assertEquals((1..160).toList(), filled.chapters.map { it.order })
-        assertTrue(filled.isComplete, "补齐后 order 覆盖了服务端声称的全部范围")
+    }
+
+    @Test
+    fun `补齐不改动 isComplete`() {
+        // 补齐只是把 order 区间补完整，不代表服务端目录已拉全——边加载边补齐时尤其如此，
+        // 这个标记必须由调用方按实际情况给
+        val filled = truncatedCatalog().fillMissingLeadingOrders(expectedTotal = 160)
+
+        assertFalse(filled.isComplete)
     }
 
     @Test
