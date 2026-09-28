@@ -32,6 +32,19 @@ android {
             storePassword = localProps.getProperty("STORE_PASSWORD", "123456")
             keyAlias = localProps.getProperty("KEY_ALIAS", "shizq")
             keyPassword = localProps.getProperty("KEY_PASSWORD", "123456")
+
+            // 三种签名方案全开，覆盖率最大：
+            // - V1（JAR 签名）：最老设备 / 部分第三方安装器与校验工具只认它。
+            //   默认值取决于 minSdk（本项目 26 时默认关闭），这里显式打开。
+            // - V2：Android 7.0+ 的整包签名，也是目前实际生效的那一层。
+            // - V3：Android 9.0+，在 V2 基础上记录签名者信息（支持密钥轮换）。
+            // 三者共存不冲突，Android 会按版本取它支持的最高一档校验。
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+            // V4 只服务于增量安装（adb install --incremental），需要额外分发 .idsig
+            // 文件，单独装 APK 没有任何作用，保持关闭。
+            enableV4Signing = false
         }
     }
     buildTypes {
