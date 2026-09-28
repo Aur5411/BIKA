@@ -234,6 +234,13 @@ class DnsSettingsViewModel @Inject constructor(
             }
             jobs.joinAll()
             _uiState.value = _uiState.value.copy(isTesting = false)
+
+            // 测完立刻落盘：API 与图片各取延迟最低的那一个。
+            // 这就是"默认都选延迟最低"的落点——原先要用户再点一次「应用最低延迟」，
+            // 而实际上没人会去点，于是长期停在初始的默认 IP 上。
+            // imageDnsHosts 会被 DirectDns 应用到所有 *.picacomic.com 图片域名，
+            // 所以这一个选择直接决定封面/章节图的快慢。
+            applyLowestLatencyIp()
         }
     }
 
@@ -318,6 +325,14 @@ class DnsSettingsViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 把 API 与图片域名各自切到延迟最低的那个 IP。
+     *
+     * 除了「应用最低延迟」按钮，延迟测完也会自动调用一次——"默认选延迟最低"。
+     *
+     * 一次都没测通时（全部超时或尚未测过）不动现有配置：宁可保留用户原来的选择，
+     * 也不要把配置写成一个连不上的 IP。
+     */
     fun applyLowestLatencyIp() {
         val allResults = _uiState.value.lines.values.flatten()
         val lowestApiResult = allResults
@@ -329,6 +344,9 @@ class DnsSettingsViewModel @Inject constructor(
             .filter { it.domain == "picacomic.com" && it.latency != null && it.latency != Long.MAX_VALUE }
             .minByOrNull { it.latency ?: Long.MAX_VALUE }
         val lowestImage = lowestImageResult?.ip
+
+        // 两个域名都没测出可用结果：保持原样，别把配置写坏
+        if (lowestApi == null && lowestImage == null) return
 
         viewModelScope.launch {
             val currentData = userPreferencesDataSource.userData.first()

@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.tracing.trace
 import coil3.ImageLoader
 import coil3.annotation.ExperimentalCoilApi
+import coil3.disk.DiskCache
+import coil3.memory.MemoryCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.util.DebugLogger
 import com.shizq.bika.core.datastore.UserCredentialsDataSource
@@ -45,7 +47,17 @@ import kotlinx.serialization.json.Json
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import okio.Path.Companion.toPath
 import java.util.concurrent.TimeUnit
+
+/** 图片磁盘缓存的目录名，沿用 Coil 惯例。 */
+private const val IMAGE_CACHE_DIR_NAME = "image_cache"
+
+/** 图片磁盘缓存下限：小屏幕设备算出来太小时也要够存几十张原图。 */
+private const val MIN_IMAGE_DISK_CACHE_BYTES = 64L * 1024 * 1024
+
+/** 图片磁盘缓存上限：长漫画的原图能堆到几个 GB，必须封顶。 */
+private const val MAX_IMAGE_DISK_CACHE_BYTES = 512L * 1024 * 1024
 
 /**
  * API 域名的并发请求上限。
@@ -178,6 +190,21 @@ internal object NetworkModule {
             .build()
     }
 
+    /**
+     * 图片加载器。
+     *
+     * ## 这里必须显式建缓存
+     *
+     * Coil 3 的 [ImageLoader.Builder] **不会**自动创建磁盘缓存——整个 Coil 产物里
+     * 没有任何默认缓存目录名，`diskCache` 默认为 null。不显式配置的话，
+     * `NetworkFetcher.readFromDiskCache()` 会因为 `diskCache.value == null` 直接返回 null：
+     * 内存缓存之外什么都没有，于是**每次冷启动、每次进新页面，所有封面和章节图都要
+     * 从网络重下**。阅读器里那些 `diskCachePolicy(CachePolicy.ENABLED)` 的写法
+     * 也会一并变成空操作。用户侧的感受就是"封面加载很慢"。
+     *
+     * 两处都用 lambda 形式，Coil 会把它包成 lazy：磁盘缓存到第一次真正加载图片时才
+     * 建目录、读日志，不在 Application.onCreate 的主线程上做文件 IO。
+     */
     @Provides
     @Singleton
     @OptIn(ExperimentalCoilApi::class)
@@ -186,6 +213,24 @@ internal object NetworkModule {
         @ApplicationContext application: Context,
     ): ImageLoader = trace("ImageLoader") {
         ImageLoader.Builder(application)
+            .memoryCache {
+                MemoryCache.Builder()
+                    // 内存缓存吃的是应用可用内存：太小会让列表滚动时反复解码，
+                    // 太大则挤压其它组件。20% 是常用取值
+                    .maxSizePercent(application, 0.20)
+                    .build()
+            }
+            .diskCache {
+                DiskCache.Builder()
+                    // 路径与 Coil 惯例一致，避免与旧版本留下的目录分家、白丢缓存
+                    .directory(application.cacheDir.resolve(IMAGE_CACHE_DIR_NAME).absolutePath.toPath())
+                    // 按可用空间自适应并设上下界：目录里躺的是原图，
+                    // 长漫画能堆到几个 GB，必须封顶
+                    .maxSizePercent(0.02)
+                    .minimumMaxSizeBytes(MIN_IMAGE_DISK_CACHE_BYTES)
+                    .maximumMaxSizeBytes(MAX_IMAGE_DISK_CACHE_BYTES)
+                    .build()
+            }
             .components {
                 add(OkHttpNetworkFetcherFactory(
                     callFactory = { okHttpClient },
