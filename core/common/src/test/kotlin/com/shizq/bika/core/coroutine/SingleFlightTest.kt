@@ -19,6 +19,12 @@ import kotlin.test.assertTrue
  * 这个类存在的动机是"同一份响应被两个消费者各取一半、导致同一个 GET 打两遍"，
  * 所以"并发只发一次"和"请求结束后不复用旧结果"这两条是它的核心契约，
  * 各自都有用例覆盖。
+ *
+ * 用例统一把 [TestScope.backgroundScope] 而不是 `this` 传给 [SingleFlight]：
+ * 被传入的 scope 会成为内部 flightScope 的父 Job，而 `runTest` 结束时会等待
+ * 测试作用域下所有子 Job 结束。传 `this` 等于给测试挂了一个永不结束的子 Job，
+ * 用例只能靠 60 秒超时失败（UncompletedCoroutinesError）；
+ * backgroundScope 的子 Job 在测试收尾时统一取消，正是为这种"长期驻留设施"准备的。
  */
 class SingleFlightTest {
 
@@ -26,7 +32,7 @@ class SingleFlightTest {
     fun `并发调用同一 key 只执行一次`() = runTest {
         val calls = AtomicInteger(0)
         val gate = CompletableDeferred<Unit>()
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
 
         val block: suspend () -> Int = {
             calls.incrementAndGet()
@@ -51,7 +57,7 @@ class SingleFlightTest {
     @Test
     fun `不同 key 各自执行`() = runTest {
         val calls = AtomicInteger(0)
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
 
         val a = async { singleFlight.run("k1") { calls.incrementAndGet() } }
         val b = async { singleFlight.run("k2") { calls.incrementAndGet() } }
@@ -65,7 +71,7 @@ class SingleFlightTest {
     @Test
     fun `请求结束后不复用结果`() = runTest {
         val calls = AtomicInteger(0)
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
         val block: suspend () -> Int = { calls.incrementAndGet() }
 
         // 刻意串行：合流窗口只覆盖"请求在途"这段时间。
@@ -78,7 +84,7 @@ class SingleFlightTest {
 
     @Test
     fun `完成后登记被摘除`() = runTest {
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
 
         singleFlight.run("k") { 1 }
         advanceUntilIdle()
@@ -90,19 +96,22 @@ class SingleFlightTest {
     @Test
     fun `失败传播给所有等待者且不留下登记`() = runTest {
         val gate = CompletableDeferred<Unit>()
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
         val block: suspend () -> Int = {
             gate.await()
             throw IllegalStateException("boom")
         }
 
-        val a = async { singleFlight.run("k", block) }
-        val b = async { singleFlight.run("k", block) }
+        // 调用者自己包住异常再 await：async 失败会取消父 Job，直接让 a/b 失败会把
+        // 测试作用域一起打掉，runTest 收尾时重新抛出同一个异常，
+        // 用例就看不到后面两行断言了
+        val a = async { runCatching { singleFlight.run("k", block) } }
+        val b = async { runCatching { singleFlight.run("k", block) } }
         advanceUntilIdle()
         gate.complete(Unit)
 
-        assertFailsWith<IllegalStateException> { a.await() }
-        assertFailsWith<IllegalStateException> { b.await() }
+        assertTrue(a.await().exceptionOrNull() is IllegalStateException)
+        assertTrue(b.await().exceptionOrNull() is IllegalStateException)
         advanceUntilIdle()
 
         // 失败的 Deferred 留在表里会让后来者 await 到同一个异常，
@@ -113,7 +122,7 @@ class SingleFlightTest {
     @Test
     fun `失败后下一次调用重新执行`() = runTest {
         val calls = AtomicInteger(0)
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
 
         assertFailsWith<IllegalStateException> {
             singleFlight.run("k") {
@@ -133,7 +142,7 @@ class SingleFlightTest {
     fun `一个调用者取消不影响其他调用者`() = runTest {
         // 关键场景：Paging 重建分页源会取消它那边的 load，
         // 而置顶评论仍在等同一个请求。共享请求挂在独立 scope 上才不会被带走
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
         val gate = CompletableDeferred<Unit>()
         val block: suspend () -> Int = {
             gate.await()
@@ -154,21 +163,31 @@ class SingleFlightTest {
     fun `全部调用者取消后共享请求仍然跑完并摘除登记`() = runTest {
         // 共享请求挂在独立 scope 上，没人等了它也会跑完并自行摘除登记。
         // 这是刻意的取舍：宁可多跑一次，也不让"取消其中一方"变成另一方的失败
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
         val started = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<Unit>()
         val finished = CompletableDeferred<Unit>()
 
         val job = launch {
             singleFlight.run("k") {
                 started.complete(Unit)
+                gate.await()
                 99.also { finished.complete(Unit) }
             }
         }
-        advanceUntilIdle()
-        assertTrue(started.isCompleted)
+
+        // 用 await(started) 而不是 advanceUntilIdle 来判断"请求已经开始"：共享请求
+        // 跑在 backgroundScope 上，而 advanceUntilIdle 只保证前台任务推进完，
+        // 拿它当栅栏会得到一个偶发为假的前提
+        started.await()
 
         job.cancelAndJoin()
-        advanceUntilIdle()
+        gate.complete(Unit)
+
+        // 等共享请求自己跑完。这里不能靠 advanceUntilIdle：它只保证前台任务推进到底，
+        // 跑在 backgroundScope 上的共享请求不会被它驱动，断言会得到假失败。
+        // 用 await 才是最直接的"它会跑完"证据——真的没跑完就会卡在 runTest 的超时上。
+        finished.await()
 
         assertTrue(finished.isCompleted, "共享请求不该随调用者一起被取消")
         assertEquals(0, singleFlight.inFlightCount)
@@ -180,7 +199,7 @@ class SingleFlightTest {
         // 取消父 Job 是另一回事，两者同时发生。
         // SingleFlight 内部必须插一层 SupervisorJob 把失败隔断，否则传入
         // viewModelScope 时，一次评论请求失败会让该 ViewModel 后续所有协程停摆。
-        val singleFlight = SingleFlight<String, Int>(this)
+        val singleFlight = SingleFlight<String, Int>(backgroundScope)
         val outerJob = coroutineContext[Job]
 
         assertFailsWith<IllegalStateException> {

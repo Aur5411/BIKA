@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onEach
@@ -51,8 +52,16 @@ class ReadingProgressWriter(
      * 因此与防抖写入之间有确定的先后顺序——这是把切章写入「并进」流水线的关键：
      * 若用 scope.launch 直接调 sink，它与 collector 是两个并发写入者，
      * 切章瞬间可能被一条迟到的防抖写入覆盖。
+     *
+     * replay = 1：collector 是 launchIn 起的，在它真正订阅上之前发出的值
+     * 需要一个缓存位才不丢。切章与 ON_STOP 都发生在"构造完立刻调用"的时序里
+     * （组合进入即触发），replay = 0 会让这些写入静默消失——正是"退出阅读器后
+     * 进度没保存"这类最难复现的丢进度问题。
      */
-    private val immediateWrites = MutableSharedFlow<ChapterProgress>(extraBufferCapacity = 8)
+    private val immediateWrites = MutableSharedFlow<ChapterProgress>(
+        replay = 1,
+        extraBufferCapacity = 8,
+    )
 
     /** 写入闸门。恢复未确认前保持 Closed，[submit] 直接丢弃。 */
     @Volatile
@@ -61,7 +70,14 @@ class ReadingProgressWriter(
 
     init {
         merge(
-            submissions.sample(debounce),
+            // 防抖到期时二次检查闸门。submit() 只能拦住"新值进入 submissions"，
+            // 已经进入的值仍会在防抖到期后无条件发射；而切章（closeGate）恰恰
+            // 常发生在防抖窗口之内，那条迟到的旧章节页码必须在这里被拦掉，
+            // 否则它会覆盖切章时写入的真实位置。
+            //
+            // 闸门过滤只加在防抖这一路：immediateWrites 承载的是切章写入，
+            // 它按设计就要绕过闸门（旧章节的进度与新章节的恢复状态无关）。
+            submissions.sample(debounce).filter { gate == PersistGate.Open },
             immediateWrites,
         )
             // 只对相邻重复去重。注意不能把 immediateWrites 排除在外——切章写入的
@@ -103,9 +119,15 @@ class ReadingProgressWriter(
      * 改动：不再从 replayCache 取值，调用方显式传入要写的进度。
      * 同步返回、不挂起：调用方可能是 onDispose 这类同步回调。实际写库在
      * [scope]（viewModelScope）里完成，不受组合生命周期影响。
+     *
+     * 同时压进 [submissions]：flush 的语义是"我现在真实读到这"，必须顶掉防抖
+     * 窗口里那个尚未到期的旧值。只走 immediateWrites 的话，几百毫秒前的旧页码
+     * 会在 flush 落库之后才到，把进度又写回去——用户侧表现为"退出再进来，
+     * 进度倒退了几页"。防抖流那侧有闸门过滤，这里不需要再判断。
      */
     fun flush(progress: ChapterProgress) {
         if (gate != PersistGate.Open) return
+        submissions.tryEmit(progress)
         immediateWrites.tryEmit(progress)
     }
 

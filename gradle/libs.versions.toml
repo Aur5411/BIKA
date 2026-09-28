@@ -119,6 +119,10 @@ kotlin-logging = { module = "io.github.oshai:kotlin-logging", version.ref = "kot
 kotlin-logging-android = { module = "io.github.oshai:kotlin-logging-android", version.ref = "kotlinLogging" }
 kotlin-metadata = { module = "org.jetbrains.kotlin:kotlin-metadata-jvm", version.ref = "kotlin" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+# kotlin-test-junit 才是把 kotlin.test.Test / kotlin.test.assertEquals 绑定到 JUnit4 的那一层。
+# 只加 kotlin-test 的话 kotlin.test.* 里的声明没有 actual 实现，写 `import kotlin.test.Test`
+# 会直接 Unresolved reference——这与 app / core:network 都显式声明两个包的事实一致。
+kotlin-test-junit = { module = "org.jetbrains.kotlin:kotlin-test-junit", version.ref = "kotlin" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinxCoroutines" }
@@ -132,6 +136,11 @@ ktor-serialization-kotlinx-json = { group = "io.ktor", name = "ktor-serializatio
 ktor-client-logging = { group = "io.ktor", name = "ktor-client-logging", version.ref = "ktor" }
 
 # Logging
+# slf4j-api 只用于单元测试：库模块的代码普遍用 io.github.oshai:kotlin-logging，
+# 它初始化 logger 时要解析 org.slf4j.LoggerFactory，而真正的绑定（log4j / logback）
+# 只声明在 core:logging 且是 implementation，不会传递到其他模块的单测运行时，
+# 于是任何碰到 logger 的用例都会以 NoClassDefFoundError 失败。这里给单测补上 API 层。
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 log4j-core = { module = "org.apache.logging.log4j:log4j-core", version.ref = "log4j-core" }
 log4j-slf4j-impl = { module = "org.apache.logging.log4j:log4j-slf4j2-impl", version.ref = "log4j-core" }
 logback-android = { module = "com.github.tony19:logback-android", version = "logback-android" }

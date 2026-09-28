@@ -27,7 +27,14 @@ class AndroidLibraryConventionPlugin : Plugin<Project> {
             dependencies {
                 "androidTestImplementation"(libs.findLibrary("kotlin.test").get())
                 "testImplementation"(libs.findLibrary("kotlin.test").get())
+                // kotlin-test 单独一个包不提供 kotlin.test.* 的 JUnit4 实现，
+                // 少了这一行各模块写 `import kotlin.test.Test` 会 Unresolved reference
+                "testImplementation"(libs.findLibrary("kotlin.test.junit").get())
                 "testImplementation"(libs.findLibrary("junit").get())
+                // kotlin-logging 在类初始化时解析 org.slf4j.LoggerFactory，而 slf4j 的具体
+                // 绑定只声明在 core:logging 且为 implementation。少了这一行，任何在
+                // 静态初始化里建 logger 的类一旦被单测触到就抛 NoClassDefFoundError。
+                "testImplementation"(libs.findLibrary("slf4j.api").get())
 
                 "implementation"(libs.findLibrary("androidx.tracing.ktx").get())
 

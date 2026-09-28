@@ -2,8 +2,6 @@ package com.shizq.bika.feature.comicdetail.impl
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.paging.PagingData
-import androidx.paging.cachedIn
 import com.shizq.bika.core.data.model.Chapter
 import com.shizq.bika.core.data.repository.ChapterRepository
 import com.shizq.bika.core.database.dao.ReadingHistoryDao
@@ -15,6 +13,9 @@ import com.shizq.bika.core.message.MessageReporter
 import com.shizq.bika.core.message.UiText
 import com.shizq.bika.core.message.reportError
 import com.shizq.bika.core.message.reportInfo
+import com.shizq.bika.feature.comicdetail.impl.episodes.ChapterSortOrder
+import com.shizq.bika.feature.comicdetail.impl.episodes.EpisodeListState
+import com.shizq.bika.feature.comicdetail.impl.episodes.applySortOrder
 import com.shizq.bika.feature.comicdetail.impl.statemachine.UnitedDetailsStateMachine
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
@@ -22,8 +23,10 @@ import dagger.assisted.AssistedInject
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -50,6 +53,85 @@ class ComicInfoViewModel @AssistedInject constructor(
 
     val state = stateMachine.state
 
+    /**
+     * 目录排序偏好。
+     *
+     * 只活在 ViewModel 里：退出详情页即恢复默认正序。写进 DataStore 需要动
+     * 偏好序列化与迁移，而"上次看的排序"对多数人是一次性的浏览习惯，
+     * 不值得为它引入一次 schema 变更。
+     */
+    private var episodeSortOrder = ChapterSortOrder.ASCENDING
+
+    /**
+     * 已完整拉取的章节目录（升序）。排序只在这份列表上做反转，
+     * 不重新请求、也不重新拉数据。
+     */
+    private var loadedChapters: List<Chapter> = emptyList()
+
+    private val _episodes = MutableStateFlow(EpisodeListState.Empty)
+
+    /** 章节目录。一次性拉全后再交给 UI，不做"边滚边补"的渐进渲染。 */
+    val episodes: StateFlow<EpisodeListState> = _episodes.asStateFlow()
+
+    init {
+        loadEpisodeCatalog()
+    }
+
+    /**
+     * 拉全整本章节目录。
+     *
+     * 走 [ChapterRepository.getCompleteChapterCatalog]（一次性、失败即抛）而不是
+     * 边拉边发的目录流：
+     *
+     * - 目录页要么是完整目录、要么明确失败可重试，"少几十话的列表" 比 "加载失败"
+     *   有害得多——用户会以为这本漫画就这么多话；
+     * - 不再依赖 LazyGrid 滚到底触发分页 append，翻页正确性不再押在滚动行为上。
+     */
+    fun loadEpisodeCatalog() {
+        viewModelScope.launch {
+            _episodes.value = EpisodeListState(isLoading = true, sortOrder = episodeSortOrder)
+            try {
+                val catalog = chapterRepository.getCompleteChapterCatalog(comicId)
+                loadedChapters = catalog.chapters
+                logger.info {
+                    "章节目录加载完成: comicId=$comicId 共 ${catalog.chapters.size} 话 " +
+                            "(isComplete=${catalog.isComplete})"
+                }
+                emitEpisodeState()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(e) { "章节目录加载失败: comicId=$comicId" }
+                _episodes.value = EpisodeListState(
+                    isLoading = false,
+                    loadFailed = true,
+                    sortOrder = episodeSortOrder,
+                )
+            }
+        }
+    }
+
+    /**
+     * 切换正序 / 倒序。
+     *
+     * 只重排已经在手的列表，不触发任何网络请求。状态由 [emitEpisodeState] 统一
+     * 重算，**不依赖 combine 之类的流合并**——那种写法一旦上游没发出新值，
+     * 用户侧的表现就是"点了没反应"，且很难从结果倒推原因。
+     */
+    fun toggleEpisodeSortOrder() {
+        episodeSortOrder = episodeSortOrder.toggled()
+        emitEpisodeState()
+    }
+
+    private fun emitEpisodeState() {
+        _episodes.value = EpisodeListState(
+            chapters = loadedChapters.applySortOrder(episodeSortOrder),
+            sortOrder = episodeSortOrder,
+            isLoading = false,
+            loadFailed = false,
+        )
+    }
+
     val downloadTasks = downloadTaskRepository.observeTasksByComic(comicId)
         .stateIn(
             scope = viewModelScope,
@@ -64,21 +146,13 @@ class ComicInfoViewModel @AssistedInject constructor(
             initialValue = emptyList()
         )
 
-    /**
-     * 章节列表。
-     *
-     * 分页与页尺寸都由 [ChapterRepository] 决定：原先这里自建 Pager + EpisodePagingSource，
-     * 与 repository 的 getChapterList 打同一个端点做同一件事，两份实现已经分叉。
-     */
-    val episodesFlow: Flow<PagingData<Chapter>> = chapterRepository.getChapterList(comicId)
-        .cachedIn(viewModelScope)
-
     fun dispatch(action: UnitedDetailsAction) {
         viewModelScope.launch {
             stateMachine.dispatch(action)
         }
     }
 
+    /** 章节列表（供"全部下载"用的一次性全量拉取）。 */
     private suspend fun fetchAllEpisodes(): List<Chapter> =
         chapterRepository.getAllChapters(comicId)
 

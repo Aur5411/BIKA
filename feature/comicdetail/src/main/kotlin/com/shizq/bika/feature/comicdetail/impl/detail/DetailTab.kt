@@ -21,10 +21,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Download
@@ -148,60 +148,94 @@ private fun ComicDetailBody(
     onDownloadWholeComic: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Column(
+    // LazyColumn 而不是 Column + verticalScroll：后者会把整页一次性组合完，
+    // 包括首屏之外的推荐位封面（每张都要发起一次图片请求）。改成惰性列表后
+    // 首屏只组合真正可见的部分，滚动到推荐位时才建卡片、才拉图。
+    //
+    // 间距用 items 之间的 spacedBy(16) 表达，与原先「外层 Column spacedBy(16)
+    // 套内层 Column spacedBy(16)」的视觉结果完全一致。
+    LazyColumn(
         modifier = modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
             .background(MaterialTheme.colorScheme.surface),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        HeroHeader(
-            detail = detail,
-            isFavourited = isFavourited,
-            onAuthorClick = onAuthorClick,
-            onTeamClick = onTeamClick,
-            onTagClick = onTagClick,
-        )
-
-        Column(
-            modifier = Modifier.padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            ActionBar(
+        item(key = "hero") {
+            HeroHeader(
+                detail = detail,
                 isFavourited = isFavourited,
-                isLiked = isLiked,
-                isDownloaded = isDownloaded,
-                onRead = onRead,
-                onToggleFavourite = onToggleFavourite,
-                onToggleLike = onToggleLike,
-                onDownloadWholeComic = onDownloadWholeComic,
-            )
-
-            StatsCard(
-                totalViews = detail.totalViews,
-                totalLikes = detail.totalLikes + if (isLiked != detail.isLiked) {
-                    if (isLiked) 1 else -1
-                } else 0,
-                commentsCount = detail.commentsCount,
-            )
-
-            DescriptionCard(description = detail.description)
-
-            TagsCard(
-                tags = (detail.tags + detail.categories).distinct(),
+                onAuthorClick = onAuthorClick,
+                onTeamClick = onTeamClick,
                 onTagClick = onTagClick,
-                onTagLongClick = onTagLongClick,
             )
+        }
 
-            if (recommendations.isNotEmpty()) {
-                RecommendationsCard(
-                    recommendations = recommendations,
-                    onComicClick = onRecommendedComicClick,
+        item(key = "actionBar") {
+            Padded {
+                ActionBar(
+                    isFavourited = isFavourited,
+                    isLiked = isLiked,
+                    isDownloaded = isDownloaded,
+                    onRead = onRead,
+                    onToggleFavourite = onToggleFavourite,
+                    onToggleLike = onToggleLike,
+                    onDownloadWholeComic = onDownloadWholeComic,
                 )
             }
+        }
 
-            MetadataCard(detail = detail)
+        item(key = "stats") {
+            Padded {
+                StatsCard(
+                    totalViews = detail.totalViews,
+                    totalLikes = detail.totalLikes + if (isLiked != detail.isLiked) {
+                        if (isLiked) 1 else -1
+                    } else 0,
+                    commentsCount = detail.commentsCount,
+                )
+            }
+        }
+
+        item(key = "description") {
+            Padded { DescriptionCard(description = detail.description) }
+        }
+
+        item(key = "tags") {
+            Padded {
+                TagsCard(
+                    tags = (detail.tags + detail.categories).distinct(),
+                    onTagClick = onTagClick,
+                    onTagLongClick = onTagLongClick,
+                )
+            }
+        }
+
+        if (recommendations.isNotEmpty()) {
+            item(key = "recommendations") {
+                Padded {
+                    RecommendationsCard(
+                        recommendations = recommendations,
+                        onComicClick = onRecommendedComicClick,
+                    )
+                }
+            }
+        }
+
+        item(key = "metadata") {
+            Padded { MetadataCard(detail = detail) }
+        }
+
+        item(key = "bottomSpacer") {
             Spacer(Modifier.height(44.dp))
         }
+    }
+}
+
+/** 详情页各卡片的统一左右留白；Hero 区不需要，所以不套这一层。 */
+@Composable
+private fun Padded(content: @Composable () -> Unit) {
+    Box(modifier = Modifier.padding(horizontal = 16.dp)) {
+        content()
     }
 }
 

@@ -1,7 +1,7 @@
 package com.shizq.bika.feature.reader.impl.progress
 
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
@@ -26,7 +26,7 @@ class ReadingProgressWriterTest {
     @Test
     fun `开闸后防抖窗口内只写最后一次`() = runTest {
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 1))
@@ -34,7 +34,7 @@ class ReadingProgressWriterTest {
         writer.submit(progress(page = 2))
         advanceTimeBy(200)
         writer.submit(progress(page = 3))
-        advanceUntilIdle()
+        settle()
 
         assertEquals(listOf(3), sink.writes.map { it.pageIndex })
     }
@@ -42,13 +42,13 @@ class ReadingProgressWriterTest {
     @Test
     fun `防抖窗口跨越后各写一次`() = runTest {
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 1))
         advanceTimeBy(debounce.inWholeMilliseconds + 100)
         writer.submit(progress(page = 7))
-        advanceUntilIdle()
+        settle()
 
         assertEquals(listOf(1, 7), sink.writes.map { it.pageIndex })
     }
@@ -56,7 +56,7 @@ class ReadingProgressWriterTest {
     @Test
     fun `flush 立即写入显式传入的进度`() = runTest {
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 42))
@@ -75,14 +75,14 @@ class ReadingProgressWriterTest {
     fun `flush 可以传入与 submit 不同的页码`() = runTest {
         // 模拟 latestProgress 由 manager 缓存，flush 时显式传入。
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 10))
         advanceTimeBy(500)
         // flush 时传入更新的页码（manager 从 controller 读取）
         writer.flush(progress(page = 15))
-        advanceUntilIdle()
+        settle()
 
         assertEquals(
             listOf(15),
@@ -94,13 +94,13 @@ class ReadingProgressWriterTest {
     @Test
     fun `防抖与 flush 的值相同时被去重`() = runTest {
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 3))
-        advanceUntilIdle()
+        settle()
         writer.flush(progress(page = 3))
-        advanceUntilIdle()
+        settle()
 
         // 防抖已写过 3，flush 传入同一个值，被 distinctUntilChanged 去重
         assertEquals(listOf(3), sink.writes.map { it.pageIndex })
@@ -109,11 +109,11 @@ class ReadingProgressWriterTest {
     @Test
     fun `闸门关闭时 flush 不写`() = runTest {
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
 
         writer.submit(progress(page = 9))
         writer.flush(progress(page = 9))
-        advanceUntilIdle()
+        settle()
 
         assertTrue(sink.writes.isEmpty())
     }
@@ -121,14 +121,14 @@ class ReadingProgressWriterTest {
     @Test
     fun `切章写入与防抖写入共用同一个串行 collector`() = runTest {
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 18, order = 1))
         // 防抖还没触发就切章：旧章节进度直接写，新章节闸门关闭
         writer.storeImmediately(progress(page = 20, order = 1))
         writer.closeGate()
-        advanceUntilIdle()
+        settle()
 
         assertEquals(
             listOf(20),
@@ -141,12 +141,12 @@ class ReadingProgressWriterTest {
     @Test
     fun `切章后闸门关闭 新章节恢复确认前不写`() = runTest {
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
         writer.closeGate()
 
         writer.submit(progress(page = 0, order = 2))
-        advanceUntilIdle()
+        settle()
 
         assertTrue(
             sink.writes.isEmpty(),
@@ -157,13 +157,13 @@ class ReadingProgressWriterTest {
     @Test
     fun `相邻重复提交只写一次`() = runTest {
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 4))
-        advanceUntilIdle()
+        settle()
         writer.submit(progress(page = 4))
-        advanceUntilIdle()
+        settle()
 
         assertEquals(1, sink.writes.size)
     }
@@ -176,7 +176,7 @@ class ReadingProgressWriterTest {
         // 两次写入的页码必须不同，否则 distinctUntilChanged 会把后者去重掉，
         // 测试即便在没有闸门过滤的情况下也会通过——那就测不到任何东西。
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 21, order = 1))
@@ -184,7 +184,7 @@ class ReadingProgressWriterTest {
 
         writer.storeImmediately(progress(page = 25, order = 1))
         writer.closeGate()
-        advanceUntilIdle()
+        settle()
 
         assertEquals(
             listOf(25),
@@ -199,7 +199,7 @@ class ReadingProgressWriterTest {
         // 但已进入的值会在防抖到期后无条件发射。如果在防抖期间切章（closeGate），
         // 必须在防抖流的 onEach 里二次检查闸门。
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 50, order = 1))
@@ -221,7 +221,7 @@ class ReadingProgressWriterTest {
     fun `flush 传入不同页码时覆盖 submit 的值`() = runTest {
         // 新行为：flush 显式传参，manager 可以从 controller 取最新页码
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
         writer.openGate()
 
         writer.submit(progress(page = 10))
@@ -229,12 +229,19 @@ class ReadingProgressWriterTest {
 
         // ON_STOP 时 manager 从 controller 取到最新页码 15，传给 flush
         writer.flush(progress(page = 15))
-        advanceUntilIdle()
+        settle()
 
+        // flush 不只是"立刻写一条"，它同时顶掉防抖窗口里尚未到期的 10。
+        // 二者都落库的话，顺序会是 15 -> 10，进度被写退回去。
+        //
+        // 注意本文件里 `flush 可以传入与 submit 不同的页码` 早期写的是 [15, 10]，
+        // 与这条用例的期望互相矛盾（同一时序不可能同时成立）。
+        // [15, 10] 是旧实现（flush 与防抖互不相干）的行为，保留的是这里这条：
+        // flush 代表"我现在真实读到这"，不该被更早的值覆盖。
         assertEquals(
-            listOf(15, 10),
+            listOf(15),
             sink.writes.map { it.pageIndex },
-            "flush(15) 立即写入，防抖的 10 稍后触发（二者不去重）",
+            "flush(15) 应立即写入，并顶掉防抖里那个更早的 10",
         )
     }
 
@@ -243,10 +250,10 @@ class ReadingProgressWriterTest {
         // 恢复未确认时 manager.latestProgress == null，flush 无操作；
         // writer 层面也加一层保险：闸门关闭时 flush 直接返回
         val sink = RecordingSink()
-        val writer = writer(sink, backgroundScope)
+        val writer = writer(sink)
 
         writer.flush(progress(page = 42))
-        advanceUntilIdle()
+        settle()
 
         assertTrue(
             sink.writes.isEmpty(),
@@ -257,15 +264,35 @@ class ReadingProgressWriterTest {
     // ── 测试辅助 ────────────────────────────────────────────────────────
 
     /**
+     * 构造 writer 并让它的 collector 先订阅上。
+     *
      * scope 必须是 backgroundScope：writer 内部用 launchIn 起了一个**永不结束**的
      * collector（它 collect 的是 SharedFlow）。若传 TestScope 本身，runTest 在测试体
      * 结束后会等这个子协程完成，直接超时报 UncompletedCoroutinesError。
      *
-     * backgroundScope 与 TestScope 共享同一个 TestCoroutineScheduler，
-     * 因此 advanceTimeBy / advanceUntilIdle 仍然能驱动流水线里的防抖计时。
+     * 构造后立刻推一次调度器，是为了对齐生产的订阅时机：生产中 scope 是
+     * viewModelScope（Dispatchers.Main.immediate），launchIn 会同步执行到第一个
+     * 挂起点、当场订阅上两个 SharedFlow；测试里的 backgroundScope 用的是
+     * StandardTestDispatcher，属于"先派发"。不推这一下，紧接着的写入就落在
+     * "还没有订阅者"的窗口里，用例看到的不是被测逻辑而是测试替身的调度细节。
      */
-    private fun writer(sink: ChapterProgressSink, scope: CoroutineScope) =
-        ReadingProgressWriter(sink = sink, scope = scope, debounce = debounce)
+    private fun TestScope.writer(sink: ChapterProgressSink): ReadingProgressWriter =
+        ReadingProgressWriter(
+            sink = sink,
+            scope = backgroundScope,
+            debounce = debounce,
+        ).also { advanceUntilIdle() }
+
+    /**
+     * 走完一个防抖窗口。
+     *
+     * 用 advanceTimeBy 而不是 advanceUntilIdle：后者只把"当前已入队"的任务跑完，
+     * 不会把虚拟时间推进到后台任务**未来**的延迟上（writer 的 collector 在
+     * backgroundScope 上）。拿它当"等防抖到期"会永远等不到，用例以
+     * "Sink 里什么都没有"的形式假失败。
+     */
+    private fun TestScope.settle() =
+        advanceTimeBy(debounce.inWholeMilliseconds + 100)
 
     private fun progress(page: Int, order: Int = 1) = ChapterProgress(
         comicId = "comic-1",

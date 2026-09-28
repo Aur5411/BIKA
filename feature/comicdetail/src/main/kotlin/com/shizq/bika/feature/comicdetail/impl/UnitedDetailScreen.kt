@@ -25,9 +25,6 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.paging.compose.LazyPagingItems
-import androidx.paging.compose.collectAsLazyPagingItems
-import com.shizq.bika.core.data.model.Chapter
 import com.shizq.bika.core.database.model.ChapterProgressEntity
 import com.shizq.bika.core.download.model.DownloadTask
 import com.shizq.bika.core.ui.ErrorState
@@ -35,6 +32,7 @@ import com.shizq.bika.core.ui.LoadingState
 import com.shizq.bika.feature.comicdetail.impl.comments.CommentsTab
 import com.shizq.bika.feature.comicdetail.impl.detail.DetailTab
 import com.shizq.bika.feature.comicdetail.impl.detail.PageTab
+import com.shizq.bika.feature.comicdetail.impl.episodes.EpisodeListState
 import com.shizq.bika.feature.comicdetail.impl.episodes.EpisodesPage
 import kotlinx.coroutines.launch
 
@@ -51,7 +49,7 @@ fun ComicDetailScreen(
     viewModel: ComicInfoViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val episodes = viewModel.episodesFlow.collectAsLazyPagingItems()
+    val episodes by viewModel.episodes.collectAsStateWithLifecycle()
     val downloadTasks by viewModel.downloadTasks.collectAsStateWithLifecycle()
     val chapterProgress by viewModel.chapterProgress.collectAsStateWithLifecycle()
 
@@ -72,6 +70,8 @@ fun ComicDetailScreen(
         downloadTasks = downloadTasks,
         onAuthorClick = onAuthorClick,
         onUploaderClick = onUploaderClick,
+        onToggleEpisodeSortOrder = viewModel::toggleEpisodeSortOrder,
+        onRetryEpisodeLoad = viewModel::loadEpisodeCatalog,
     )
 }
 
@@ -79,7 +79,7 @@ fun ComicDetailScreen(
 @Composable
 fun ComicDetailContent(
     unitedState: UnitedDetailsUiState,
-    episodes: LazyPagingItems<Chapter>,
+    episodes: EpisodeListState,
     downloadTasks: List<DownloadTask>,
     chapterProgress: List<ChapterProgressEntity>,
     onBackClick: () -> Unit,
@@ -92,6 +92,8 @@ fun ComicDetailContent(
     onDownloadWholeComic: (title: String, cover: String, epsCount: Int) -> Unit,
     onTagClick: (String) -> Unit,
     navigationToEpisodeDownload: (String, String, String) -> Unit,
+    onToggleEpisodeSortOrder: () -> Unit,
+    onRetryEpisodeLoad: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     when (unitedState) {
@@ -173,11 +175,13 @@ fun ComicDetailContent(
                             )
 
                             PageTab.EPISODES -> EpisodesPage(
-                                episodes = episodes,
+                                state = episodes,
                                 chapterProgress = chapterProgress,
-                                navigateToReader = {
-                                    navigationToReader(detail.id, it)
+                                onEpisodeClick = { chapter ->
+                                    navigationToReader(detail.id, chapter.order)
                                 },
+                                onToggleSortOrder = onToggleEpisodeSortOrder,
+                                onRetryLoad = onRetryEpisodeLoad,
                                 onDownloadSelectionClick = {
                                     navigationToEpisodeDownload(
                                         detail.id,

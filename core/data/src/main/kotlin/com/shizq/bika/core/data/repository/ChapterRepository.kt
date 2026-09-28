@@ -24,6 +24,16 @@ interface ChapterRepository {
     fun getChapterCatalog(comicId: String): Flow<ChapterCatalog>
 
     /**
+     * 一次性拉全整本章节目录，失败即抛。
+     *
+     * 与 [getChapterCatalog] 的差别是**失败不降级**：目录页要么呈现完整目录、
+     * 要么明确报错让用户重试，绝不展示"看起来齐了、其实少了几十话"的列表。
+     * [getChapterCatalog] 那条流选择"记日志并保留已拉部分"，是给上下章导航用的——
+     * 导航"知道一部分"比什么都不知道强，但把它当完整目录展示就是骗人。
+     */
+    suspend fun getCompleteChapterCatalog(comicId: String): ChapterCatalog
+
+    /**
      * 一次性取回指定漫画的全部章节（非分页、非 Flow）。
      *
      * 与 [getChapterCatalog] 的区别只在交付方式：目录是长期订阅、边拉边发、带

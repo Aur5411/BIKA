@@ -11,6 +11,7 @@ import coil3.PlatformContext
 import coil3.SingletonImageLoader
 import com.shizq.bika.core.download.Download
 import com.shizq.bika.core.logging.LoggingConfigurator
+import com.shizq.bika.core.network.dns.DnsAutoSelector
 import com.shizq.bika.sync.initializers.Sync
 import com.shizq.bika.util.ProfileVerifierLogger
 import dagger.hilt.android.HiltAndroidApp
@@ -26,6 +27,9 @@ class BikaApplication : Application(), SingletonImageLoader.Factory {
     @Inject
     lateinit var profileVerifierLogger: ProfileVerifierLogger
 
+    @Inject
+    lateinit var dnsAutoSelector: DnsAutoSelector
+
     private val logger = KotlinLogging.logger("BikaApplication")
 
     override fun onCreate() {
@@ -36,6 +40,9 @@ class BikaApplication : Application(), SingletonImageLoader.Factory {
         Download.initialize(this)
         profileVerifierLogger()
         setupGlobalExceptionHandler()
+        // 冷启动顺手挑一条延迟最低的分流线路。放到最后调用，且内部是
+        // 「起个后台协程就返回」，不会占用启动路径的时间。
+        dnsAutoSelector.optimizeOnColdStart()
         logger.info { "Application initialized successfully" }
     }
 

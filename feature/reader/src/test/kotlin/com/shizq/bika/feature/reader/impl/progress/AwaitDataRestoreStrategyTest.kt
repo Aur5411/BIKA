@@ -210,19 +210,24 @@ class AwaitDataRestoreStrategyTest {
         override fun isLoaded(index: Int): Boolean = index < loaded.value
 
         override suspend fun awaitLoadedOrBounds(index: Int): PageLoadResult {
-            return loaded.first { currentLoaded ->
-                when {
-                    index < 0 -> true
-                    index < currentLoaded -> true
-                    isComplete && index >= totalPages -> true
-                    else -> false
-                }
-            }.let {
-                when {
-                    index < 0 -> PageLoadResult.OutOfBounds(totalPages)
-                    index < loaded.value -> PageLoadResult.Loaded
-                    else -> PageLoadResult.OutOfBounds(totalPages)
-                }
+            // 越界判定必须先于"等数据"：totalPages 就是这一章的总项数，
+            // 索引落在它之外说明数据库里的 pageIndex 已经超出章节现有范围
+            // （服务端删图/重排），再等也不会到位。
+            //
+            // 原先这里把越界条件写成 `isComplete && index >= totalPages`，
+            // 而用例普遍不传 isComplete（默认 false），于是谓词永远为假、
+            // first{} 一直挂起到外层超时——测的就不是"快速失败"，
+            // 而是"等满 10 秒超时"，与用例名和注释完全相反。
+            if (index < 0 || index >= totalPages) {
+                return PageLoadResult.OutOfBounds(totalPages)
+            }
+            // 索引在总页数之内：等它变成真实数据。
+            // 已经加载完却仍没等到，说明这个索引实际不存在，同样判越界。
+            loaded.first { index < it || isComplete }
+            return if (index < loaded.value) {
+                PageLoadResult.Loaded
+            } else {
+                PageLoadResult.OutOfBounds(totalPages)
             }
         }
     }

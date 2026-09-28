@@ -15,5 +15,6 @@ dependencies {
     implementation(libs.flowredux)
 
     testImplementation(libs.androidx.test.core)
+    testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)
 }

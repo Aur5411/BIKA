@@ -18,18 +18,27 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.shizq.bika.core.data.model.Chapter
 import com.shizq.bika.core.database.model.ChapterProgressEntity
 import com.shizq.bika.core.database.model.isCompleted
 
+/**
+ * 单个章节卡片。
+ *
+ * [onClick] 收 [Chapter] 而不是在调用处为每个 item 现造一个捕获了 order 的
+ * lambda：lambda 每次重组都是新实例，会让 Compose 判定参数变化而无法跳过重组。
+ * 长目录（100+ 话）滚动时这类无效重组会累积成可见的掉帧。
+ */
 @Composable
 fun EpisodeItem(
     text: String,
-    onClick: () -> Unit,
+    chapter: Chapter,
+    onClick: (Chapter) -> Unit,
     modifier: Modifier = Modifier,
     progress: ChapterProgressEntity? = null
 ) {
     OutlinedCard(
-        onClick = onClick,
+        onClick = { onClick(chapter) },
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
         border = BorderStroke(
@@ -114,6 +123,7 @@ private fun EpisodeItemPreview() {
         Surface(modifier = Modifier.padding(16.dp)) {
             EpisodeItem(
                 text = "第 01 话",
+                chapter = Chapter(id = "1", title = "第 01 话", order = 1, updatedAt = ""),
                 onClick = {}
             )
         }

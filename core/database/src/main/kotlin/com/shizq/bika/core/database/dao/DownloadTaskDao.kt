@@ -275,6 +275,7 @@ interface DownloadTaskDao {
     SET status = :completedStatus,
         worker_token = NULL,
         localPath = :localPath,
+        progress = 100,
         downloadedPages = :totalPages,
         totalPages = :totalPages,
         errorCode = 'NONE',

@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -273,19 +272,9 @@ fun DashboardContent(
                         .padding(innerPadding)
                         .testTag("dashboard:grid"),
                 ) {
-                    lastReadHistory?.let { history ->
-                        item(span = { GridItemSpan(maxLineSpan) }) {
-                            QuickResumeCard(
-                                history = history,
-                                onClick = { comicId, order ->
-                                    onNavigate(DashboardDestination.Reader(comicId, order))
-                                },
-                                modifier = Modifier
-                                    .animateItem()
-                            )
-                        }
-                    }
-
+                    // 顶部原先有一张「最近浏览 / 一键续读」大卡片，按要求移除：
+                    // 它占满整行却只承载一个入口，把频道宫格整体压到首屏之外。
+                    // 续读入口仍保留在侧滑抽屉里（见 DashboardDrawerContent）。
                     items(
                         activeChannels,
                         key = { it.iconKey }

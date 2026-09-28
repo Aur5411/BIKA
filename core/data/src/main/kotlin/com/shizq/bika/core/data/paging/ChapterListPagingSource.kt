@@ -5,7 +5,7 @@ import androidx.paging.PagingState
 import com.shizq.bika.core.data.model.Chapter
 import com.shizq.bika.core.data.model.asExternalModel
 import com.shizq.bika.core.network.BikaDataSource
-import com.shizq.bika.core.network.model.nextPageKey
+import com.shizq.bika.core.network.model.nextChapterPageKey
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
@@ -31,6 +31,10 @@ class ChapterListPagingSource @AssistedInject constructor(
      */
     private val deduplicator = CrossPageDeduplicator<Chapter> { it.id }
 
+    /** 上一次成功加载的页与其 id 集合，用于识别"服务端把越界页 clamp 回上一页"。 */
+    private var lastLoadedPage: Int? = null
+    private var lastPageIds: Set<String> = emptySet()
+
     override suspend fun load(params: LoadParams<Int>): LoadResult<Int, Chapter> {
         val currentPage = params.key ?: 1
 
@@ -38,12 +42,21 @@ class ChapterListPagingSource @AssistedInject constructor(
             val epsResponse = network.getComicEpisodes(id, currentPage).eps
             val chapters = epsResponse.docs.map { it.asExternalModel() }
 
+            val currentIds = epsResponse.docs.mapTo(LinkedHashSet()) { it.id }
+            // 只有"紧接着的下一页"才做重复判断：refresh 重新加载同一页时
+            // 页内 id 天然相同，误判成 clamp 会直接把列表截断
+            val pageRepeated = lastLoadedPage == currentPage - 1 &&
+                    currentIds.isNotEmpty() &&
+                    currentIds == lastPageIds
+            lastLoadedPage = currentPage
+            lastPageIds = currentIds
+
             LoadResult.Page(
                 data = deduplicator.retainUnseen(currentPage, chapters).sortedBy { it.order },
                 prevKey = null,
                 // 判空用的是接口原始响应而非去重后的结果：整页都是重复项时
                 // 页本身是有数据的，用去重结果判空会提前终止、丢掉后面的章节
-                nextKey = epsResponse.nextPageKey(currentPage),
+                nextKey = if (pageRepeated) null else epsResponse.nextChapterPageKey(currentPage),
             )
         } catch (e: CancellationException) {
             throw e
