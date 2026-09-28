@@ -29,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -42,6 +43,7 @@ import coil3.request.error
 import coil3.request.placeholder
 import com.shizq.bika.core.model.ComicSummary
 import com.shizq.bika.core.model.RemoteImage
+import kotlin.math.roundToInt
 
 @Composable
 fun ComicCard(
@@ -154,9 +156,16 @@ fun ComicCard(
         },
         leadingContent = {
             Box(contentAlignment = Alignment.TopStart) {
+                val density = LocalDensity.current.density
+                // 封面目标像素：100dp 宽、3:4 高。Coil 3 的 size 只收像素
+                val cardWidthPx = (100f * density).roundToInt()
+                val cardHeightPx = (100f * 4f / 3f * density).roundToInt()
                 AsyncImage(
                     model = ImageRequest.Builder(LocalContext.current)
                         .data(comic.image.originalImageUrl)
+                        // 显式声明目标尺寸：不给的话 Coil 要等布局测量出约束才解码，
+                        // 列表快速滚动时容易先按原图尺寸解码再裁剪，白做一次大图解码。
+                        .size(cardWidthPx, cardHeightPx)
                         // 加载前显示占位色块，避免列表快速滚动时整行空白闪烁
                         .placeholder(ColorDrawable(0xFFE3E3E3.toInt()))
                         .error(ColorDrawable(0xFFE3E3E3.toInt()))

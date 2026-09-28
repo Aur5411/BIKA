@@ -6,6 +6,7 @@ import coil3.intercept.Interceptor
 import coil3.request.ErrorResult
 import coil3.request.ImageResult
 import coil3.request.SuccessResult
+import coil3.size.Dimension
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -29,6 +30,17 @@ private val logger = KotlinLogging.logger("DomainFallbackCoil")
 private const val SLOW_MAIN_THRESHOLD_MS = 2500L
 
 /**
+ * 小图（头像、列表缩略图）的判定上限（较长边，单位 px）。
+ *
+ * 头像只有 40dp、几百字节，主域名正常时 1 秒内就能回来。给它和整页大图一样
+ * 2.5 秒的竞速窗口，等于列表里十几个头像同时去抢降级槽位：竞速为一张小图
+ * 并发打 6 个域名，成本远高于收益，而真正需要降级的大图反而排不上队。
+ *
+ * 所以小图**不参与竞速**，直接走主域名单路请求；失败交给上层退避重试。
+ */
+private const val SMALL_IMAGE_MAX_EDGE_PX = 160
+
+/**
  * 4xx 是永久性失败：资源在这个 path 上就是不存在（404）或无权限（403），
  * 换域名重试同一个 path 不会有不同结果，只会放大成 N 倍无效请求。
  * 只有 5xx 与传输层异常（超时、DNS、连接失败）才值得换域名。
@@ -48,7 +60,34 @@ internal class FallbackMarker : AbstractCoroutineContextElement(FallbackMarker) 
 class DomainFallbackInterceptor : Interceptor {
     @Volatile
     private var optimalFallbackHost: String? = null
-    private val fallbackSlots = Semaphore(2)
+
+    /**
+     * 降级槽位。
+     *
+     * 原先是 2：评论页一屏十几个头像、详情页同时拉封面与章节图时，
+     * 槽位瞬间占满，后面的请求全部阻塞在 `withPermit` 上——
+     * 这才是"图片加载很慢"的放大器。竞速本身最多打 6 个域名，
+     * 给到 6 个槽位既够用、又不会形成无界并发。
+     */
+    private val fallbackSlots = Semaphore(6)
+
+    /**
+     * 判断是否小图。
+     *
+     * [coil3.intercept.Interceptor.Chain.size] 已经是解析后的目标尺寸
+     * （Coil 在进入拦截器链前就解析完了 sizeResolver），所以这里不需要再 suspend
+     * 取一次。任一维是 `Dimension.Undefined`（请求方没给约束）就按大图处理：
+     * 宁可按旧行为竞速，也不要因为尺寸未知把小图误判成可以不竞速。
+     */
+    private fun isSmallImage(chain: Interceptor.Chain): Boolean {
+        val size = chain.size
+        val w = (size.width as? Dimension.Pixels)?.px ?: return false
+        val h = (size.height as? Dimension.Pixels)?.px ?: return false
+        if (w <= 0 && h <= 0) return false
+        // 取较大边：只有两边都小才是小图，避免把 1×1000 这种细长图误判
+        val maxEdge = maxOf(w, h)
+        return maxEdge in 1..SMALL_IMAGE_MAX_EDGE_PX
+    }
 
     override suspend fun intercept(chain: Interceptor.Chain): ImageResult = coroutineScope {
         if (coroutineContext[FallbackMarker] != null) {
@@ -72,6 +111,13 @@ class DomainFallbackInterceptor : Interceptor {
             return@coroutineScope chain.proceed()
         }
 
+        // 小图：只等主域名，不竞速。失败交由上层退避重试。
+        val diskPreload = chain.request.decoderFactory is BlackholeDecoder.Factory
+        if (!diskPreload && isSmallImage(chain)) {
+            logger.debug { "小图走单域名直连，不参与竞速: $originalUrl" }
+            return@coroutineScope chain.proceed()
+        }
+
         // 主域名请求。异常在内部收成 ErrorResult，避免抛出去连带取消整个 coroutineScope。
         val mainRequest = async {
             try {
@@ -85,7 +131,6 @@ class DomainFallbackInterceptor : Interceptor {
         // 等一小会儿：主请求可能很快成功，也可能很快失败。
         // Disk preloads must not multiply into several downloads just because the mobile
         // connection is slow. Only try mirrors after the primary actually fails.
-        val diskPreload = chain.request.decoderFactory is BlackholeDecoder.Factory
         val earlyResult = if (diskPreload) {
             mainRequest.await()
         } else {

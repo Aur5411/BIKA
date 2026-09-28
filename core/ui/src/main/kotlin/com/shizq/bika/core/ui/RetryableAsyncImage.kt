@@ -23,11 +23,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import coil3.compose.rememberAsyncImagePainter
+import coil3.request.ImageRequest
+import kotlin.math.roundToInt
 
 /**
  * 网络图片加载组件：
@@ -35,6 +39,10 @@ import coil3.compose.rememberAsyncImagePainter
  * - 4xx、解码失败和未知终态进入最终失败；
  * - 只有最终失败状态才显示可点击的重试占位；
  * - Painter 只负责渲染，请求代数、重试和错误状态由 ImageRetryController 管理。
+ *
+ * [targetSizeDp] 用于给 Coil 声明解码尺寸。头像这类小图务必传：
+ * 不传的话 Coil 要等布局测量出约束才解码，头像原图（常常 200×200 以上）
+ * 会被整张解码再缩到 40dp，一屏十几个头像就是十几次无谓的大图解码。
  */
 @Composable
 fun RetryableAsyncImage(
@@ -43,15 +51,32 @@ fun RetryableAsyncImage(
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
     alignment: Alignment = Alignment.Center,
+    targetSizeDp: Dp? = null,
 ) {
-    val painter = rememberAsyncImagePainter(model = model)
+    val context = LocalContext.current
+    val resolvedModel = remember(model, targetSizeDp) {
+        if (model == null || targetSizeDp == null) {
+            model
+        } else {
+            // Coil 3 只提供 size(Int) / size(Int, Int) / size(Size)，
+            // 没有接受 Dp 的重载，dp→px 由这里自己换算
+            val px = with(context.resources.displayMetrics) {
+                (targetSizeDp.value * density).roundToInt()
+            }
+            ImageRequest.Builder(context)
+                .data(model)
+                .size(px, px)
+                .build()
+        }
+    }
+    val painter = rememberAsyncImagePainter(model = resolvedModel)
     val controller = remember(painter) {
         ImageRetryController(painter)
     }
     val loadState by controller.state.collectAsState()
-    var manualRetryNonce by remember(model) { mutableIntStateOf(0) }
-    val modelKey = remember(model) {
-        model?.toString() ?: "<null-model>"
+    var manualRetryNonce by remember(resolvedModel) { mutableIntStateOf(0) }
+    val modelKey = remember(resolvedModel) {
+        resolvedModel?.toString() ?: "<null-model>"
     }
 
     LaunchedEffect(modelKey, manualRetryNonce) {

@@ -360,10 +360,11 @@ fun CommentItem(
             // 可点区，不给标签的话读屏只会报一个无名可点节点
             .clickable(onClickLabel = "回复") { onReplyClick(comment) },
     ) {
-        // 头像：失败自动重试
+        // 头像：失败自动重试；显式声明 40dp 解码尺寸，避免按原图整张解码
         RetryableAsyncImage(
             model = comment.user.avatar,
             contentDescription = "用户头像",
+            targetSizeDp = 40.dp,
             modifier = Modifier
                 .size(40.dp)
                 .clip(CircleShape)
