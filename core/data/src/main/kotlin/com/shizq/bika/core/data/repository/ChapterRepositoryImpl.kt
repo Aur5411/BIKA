@@ -7,6 +7,7 @@ import com.shizq.bika.core.coroutine.ApplicationScope
 import com.shizq.bika.core.data.model.Chapter
 import com.shizq.bika.core.data.model.ChapterCatalog
 import com.shizq.bika.core.data.model.asExternalModel
+import com.shizq.bika.core.data.model.fillMissingLeadingOrders
 import com.shizq.bika.core.data.paging.ChapterListPagingSource
 import com.shizq.bika.core.data.paging.ChapterMeta
 import com.shizq.bika.core.data.paging.ChapterPagesPagingSource
@@ -58,6 +59,16 @@ private const val EPISODE_PAGE_RETRY_DELAY_MS = 300L
 
 /** 重试间隔的随机抖动上限：同批请求同时失败时，错开重发时刻。 */
 private const val EPISODE_PAGE_RETRY_JITTER_MS = 250L
+
+/**
+ * 出现空页 / 重复页后，还允许往前探几页。
+ *
+ * 正常服务端在末页之后返回空页，一次就能确认到底。但对长目录（100 话以上）
+ * 实测会出现"中间某页返回空、后面还有数据"和"越界页被 clamp 回上一页"两种情况，
+ * 一次就认输会让目录稳定丢掉最老的那几十话。这里给一个很小的探测预算：
+ * 真的到底时最多多花 [CATALOG_TERMINAL_PROBE_PAGES] 个请求，代价可忽略。
+ */
+private const val CATALOG_TERMINAL_PROBE_PAGES = 3
 
 /**
  * 整份目录的取数时限。
@@ -188,10 +199,11 @@ class ChapterRepositoryImpl @Inject constructor(
 
         val collected = mutableListOf<Chapter>()
         var complete = false
+        var expectedTotal = 0
         val startedAtMs = Clock.System.now().toEpochMilliseconds()
 
         try {
-            withTimeout(COMPLETE_CATALOG_TIMEOUT_MS) {
+            expectedTotal = withTimeout(COMPLETE_CATALOG_TIMEOUT_MS) {
                 walkEpisodePages(
                     comicId = comicId,
                     onPage = { chapters, isLastPage ->
@@ -219,10 +231,21 @@ class ChapterRepositoryImpl @Inject constructor(
             throw e
         }
 
-        val catalog = ChapterCatalog(
+        val fetched = ChapterCatalog(
             chapters = collected.sortedBy { it.order },
             isComplete = complete,
         )
+        // 服务端把长目录截断时（自报 160 话却只给 90 条），按 order 把缺失的前置章节补出来。
+        // 只在推断无歧义时才补，理由见 fillMissingLeadingOrders 的文档
+        val catalog = fetched.fillMissingLeadingOrders(expectedTotal)
+        val filled = catalog.chapters.size - fetched.chapters.size
+        if (filled > 0) {
+            logger.warn {
+                "章节目录 comic=$comicId 服务端只给到 ${fetched.chapters.size} 条" +
+                        "（自报 total=$expectedTotal），已按 order 补齐前置 $filled 条的占位条目"
+            }
+        }
+
         completeCatalogCache[comicId] = CatalogCacheEntry(
             catalog = catalog,
             storedAtMs = Clock.System.now().toEpochMilliseconds(),
@@ -289,6 +312,9 @@ class ChapterRepositoryImpl @Inject constructor(
      *
      * @param onPage 第二个参数表示本页是否为末页。因页数上限或单页彻底失败而
      *   提前终止时，最后一次回调收到的是 false
+     * @return 服务端自报的章节总数（各页 `total` 里的最大值）。0 表示服务端没给，
+     *   调用方据此判断"还差多少"——[getCompleteChapterCatalog] 用它决定要不要补占位条目
+     *
      * @param onPageError 单页重试耗尽后的处置。目录流选择"记日志并停下、保留已拉部分"，
      *   目录页选择"抛出去让用户重试"；抛出即终止整个遍历。
      *   类型是 [Throwable] 而不是 [Exception]：并发版把每页结果装进 [Result]，
@@ -298,10 +324,19 @@ class ChapterRepositoryImpl @Inject constructor(
         comicId: String,
         onPage: suspend (chapters: List<Chapter>, isLastPage: Boolean) -> Unit,
         onPageError: (page: Int, e: Throwable) -> Unit,
-    ) {
+    ): Int {
         val deduplicator = CrossPageDeduplicator<Chapter> { it.id }
         var loaded = 0
         var previousPageIds: Set<String>? = null
+
+        // 服务端自报的章节总数（取各页里最大的那个）。**不用于判断"够了"**，
+        // 只用于判断"还差"——这是它能安全派上用场的唯一方向：
+        // total 报小不会让它提前收工，但看到 loaded < total 就能确定没拉完。
+        var expectedTotal = 0
+
+        // 空页/重复页出现后还允许往前探几页。服务端偶发会把中间某页返回成空，
+        // 或者把越界页 clamp 回上一页；一次就认输会直接丢掉后面所有章节
+        var terminalProbesLeft = CATALOG_TERMINAL_PROBE_PAGES
 
         var nextPage = 1
         // 计划拉到第几页。第一轮只发第 1 页——拿到 limit/total 才谈得上规划批宽，
@@ -338,24 +373,53 @@ class ChapterRepositoryImpl @Inject constructor(
             for ((page, outcome) in outcomes) {
                 val eps = outcome.getOrElse { e ->
                     onPageError(page, e)
-                    return
+                    return expectedTotal
                 }
+                if (eps.total > expectedTotal) expectedTotal = eps.total
 
                 val currentPageIds = eps.docs.mapTo(LinkedHashSet()) { it.id }
-                // 与上一页逐字相同 = 服务端把越界页 clamp 回了上一页，再翻没有意义
+                // 与上一页逐字相同 = 服务端把越界页 clamp 回了上一页
                 val pageRepeated =
                     previousPageIds != null && currentPageIds.isNotEmpty() && currentPageIds == previousPageIds
+                val isEmptyPage = eps.docs.isEmpty()
 
                 val chapters = deduplicator.retainUnseen(page, eps.docs.map { it.asExternalModel() })
                 loaded += chapters.size
-                val isLastPage = eps.docs.isEmpty() || pageRepeated
+
+                // 空页 / 重复页原本就是终止信号，但只有在"没有理由认为还有数据"时才作数。
+                // 服务端自报 total=160 而我们只拿到 90 条，说明后面一定还有——
+                // 这时把终止信号当结论就会稳定丢掉最老的那几十话
+                val shortOfExpected = expectedTotal > 0 && loaded < expectedTotal
+                val terminalSignal = isEmptyPage || pageRepeated
+                val skipTerminalSignal = terminalSignal && shortOfExpected && terminalProbesLeft > 0
 
                 logger.info {
                     "章节目录 comic=$comicId 第 $page 页：收到 ${eps.docs.size} 条，累计 $loaded 条" +
-                            "（服务端 total=${eps.total} pages=${eps.pages} limit=${eps.limit}）" +
-                            if (isLastPage) " → 结束" else ""
+                            "（服务端返回 page=${eps.page} total=${eps.total} pages=${eps.pages}" +
+                            " limit=${eps.limit}，首条 order=${eps.docs.firstOrNull()?.order}）" +
+                            when {
+                                skipTerminalSignal -> " → 判为可疑终止信号，继续往后探"
+                                terminalSignal -> " → 结束"
+                                else -> ""
+                            }
                 }
-                if (eps.total > 0 && loaded >= eps.total && !isLastPage) {
+
+                if (skipTerminalSignal) {
+                    terminalProbesLeft--
+                    val reason = if (isEmptyPage) "空页" else "与上一页完全相同的页"
+                    logger.warn {
+                        "章节目录 comic=$comicId 第 $page 页返回$reason，但服务端自报 total=$expectedTotal" +
+                                "、目前只收到 $loaded 条，判定为「还没拉完」，跳过继续探" +
+                                "（剩余探测次数 $terminalProbesLeft）"
+                    }
+                    // 只把非空页记进 previousPageIds：空页会把基准清空，
+                    // 使得后面真正被 clamp 的页无法再被识别出来
+                    if (currentPageIds.isNotEmpty()) previousPageIds = currentPageIds
+                    onPage(chapters, false)
+                    continue
+                }
+
+                if (eps.total > 0 && loaded >= eps.total && !terminalSignal) {
                     // total 说自己齐了但接口还在给数据：以接口为准继续拉，
                     // 只把这种不自洽记下来，便于事后定位服务端问题
                     logger.warn {
@@ -364,9 +428,25 @@ class ChapterRepositoryImpl @Inject constructor(
                     }
                 }
 
-                onPage(chapters, isLastPage)
-                if (isLastPage) return
+                if (terminalSignal) {
+                    // 已经结束，但要区分"确信到底"和"探不动了"：跟服务端自报的总数对不上时
+                    // 说明后面大概率还有章节，此时不能把 isComplete 报成 true——
+                    // 阅读器的上下章导航就是靠这个标记知道边界不可信的
+                    val confidentEnd = expectedTotal <= 0 || loaded >= expectedTotal
+                    if (confidentEnd) {
+                        logger.info { "章节目录 comic=$comicId 拉取结束，共 $loaded 条" }
+                    } else {
+                        logger.warn {
+                            "章节目录 comic=$comicId 在 $loaded 条处结束，但服务端自报 total=$expectedTotal：" +
+                                    "剩余 ${expectedTotal - loaded} 条未取到，" +
+                                    "疑似服务端在无效页码上返回${if (isEmptyPage) "空页" else "重复页"}"
+                        }
+                    }
+                    onPage(chapters, confidentEnd)
+                    return expectedTotal
+                }
 
+                onPage(chapters, false)
                 previousPageIds = currentPageIds
             }
 
@@ -388,6 +468,7 @@ class ChapterRepositoryImpl @Inject constructor(
         logger.warn {
             "章节拉取到达 $MAX_CHAPTER_LIST_PAGES 页上限（已累计 $loaded 条），comic=$comicId"
         }
+        return expectedTotal
     }
 
     /**

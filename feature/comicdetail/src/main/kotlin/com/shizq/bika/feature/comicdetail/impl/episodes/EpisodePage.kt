@@ -86,20 +86,14 @@ fun EpisodesPage(
     val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
 
-    // derivedStateOf：让"是否显示回到顶部/底部"只在跨过阈值时翻转一次，
-    // 而不是滚动过程中每一帧都驱动整个 EpisodesPage 重组
-    val showScrollToTop by remember {
+    // derivedStateOf：让"是否显示跳转按钮"只在跨过阈值时翻转一次，
+    // 而不是滚动过程中每一帧都驱动整个 EpisodesPage 重组。
+    //
+    // 两个滚动按钮共用这一个条件、并且装在同一个 AnimatedVisibility 里：
+    // 分别包的话，一个先淡出、另一个还在淡入，中途能看到两个动画互相打断。
+    // 显示条件取"已离开列表顶端"，回到顶部时两个一起收掉
+    val showScrollButtons by remember {
         derivedStateOf { gridState.firstVisibleItemIndex >= SCROLL_BUTTON_THRESHOLD_ITEMS }
-    }
-    // 与"回到顶部"用同一个阈值，两个按钮的出现时机才对称：
-    // 顶端只有「到底」，中段两个都在，底部只剩「到顶」
-    val showScrollToBottom by remember {
-        derivedStateOf {
-            val info = gridState.layoutInfo
-            val lastVisibleIndex = info.visibleItemsInfo.lastOrNull()?.index
-                ?: return@derivedStateOf false
-            lastVisibleIndex <= info.totalItemsCount - 1 - SCROLL_BUTTON_THRESHOLD_ITEMS
-        }
     }
 
     Box(modifier = modifier.fillMaxSize()) {
@@ -211,44 +205,44 @@ fun EpisodesPage(
             horizontalAlignment = Alignment.End,
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // 两个滚动按钮作为**一个整体**进出，动画不会互相打断
             AnimatedVisibility(
-                visible = showScrollToTop,
+                visible = showScrollButtons,
                 enter = fadeIn() + scaleIn(),
                 exit = fadeOut() + scaleOut()
             ) {
-                FloatingActionButton(
-                    onClick = { scope.launch { gridState.animateScrollToItem(0) } },
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                Column(
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.VerticalAlignTop,
-                        contentDescription = stringResource(R.string.episode_scroll_to_top)
-                    )
-                }
-            }
+                    FloatingActionButton(
+                        onClick = { scope.launch { gridState.animateScrollToItem(0) } },
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.VerticalAlignTop,
+                            contentDescription = stringResource(R.string.episode_scroll_to_top)
+                        )
+                    }
 
-            AnimatedVisibility(
-                visible = showScrollToBottom,
-                enter = fadeIn() + scaleIn(),
-                exit = fadeOut() + scaleOut()
-            ) {
-                FloatingActionButton(
-                    onClick = {
-                        scope.launch {
-                            // 目录是渐进加载的，追加新批次会让总条目数变大；
-                            // 这里每次点击都重新取一次总数，避免滚到"上一批的末尾"
-                            val lastIndex = gridState.layoutInfo.totalItemsCount - 1
-                            if (lastIndex >= 0) gridState.animateScrollToItem(lastIndex)
-                        }
-                    },
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.VerticalAlignBottom,
-                        contentDescription = stringResource(R.string.episode_scroll_to_bottom)
-                    )
+                    FloatingActionButton(
+                        onClick = {
+                            scope.launch {
+                                // 目录是渐进加载的，追加新批次会让总条目数变大；
+                                // 这里每次点击都重新取一次总数，避免只滚到"上一批的末尾"
+                                val lastIndex = gridState.layoutInfo.totalItemsCount - 1
+                                if (lastIndex >= 0) gridState.animateScrollToItem(lastIndex)
+                            }
+                        },
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.VerticalAlignBottom,
+                            contentDescription = stringResource(R.string.episode_scroll_to_bottom)
+                        )
+                    }
                 }
             }
 
