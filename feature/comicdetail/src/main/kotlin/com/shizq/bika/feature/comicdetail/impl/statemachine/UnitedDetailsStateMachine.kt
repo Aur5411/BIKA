@@ -8,6 +8,7 @@ import com.freeletics.flowredux2.initializeWith
 import com.shizq.bika.core.database.dao.ReadingHistoryDao
 import com.shizq.bika.core.database.model.ReadingHistoryEntity
 import com.shizq.bika.core.network.BikaDataSource
+import com.shizq.bika.core.network.model.ActionData
 import com.shizq.bika.core.network.runCatchingApi
 import com.shizq.bika.feature.comicdetail.impl.ComicDetail
 import com.shizq.bika.feature.comicdetail.impl.UnitedDetailsAction
@@ -130,10 +131,10 @@ class UnitedDetailsStateMachine @AssistedInject constructor(
     }
 
     private companion object {
-        const val ACTION_LIKE = "like"
-        const val ACTION_UNLIKE = "unlike"
-        const val ACTION_FAVORITE = "favourite"
-        const val ACTION_UN_FAVORITE = "un_favourite"
+        const val ACTION_LIKE = ActionData.ACTION_LIKE
+        const val ACTION_UNLIKE = ActionData.ACTION_UNLIKE
+        const val ACTION_FAVORITE = ActionData.ACTION_FAVORITE
+        const val ACTION_UN_FAVORITE = ActionData.ACTION_UN_FAVOURITE
         private const val TAG = "UnitedDetailsStateMachine"
     }
 }

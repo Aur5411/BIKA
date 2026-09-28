@@ -123,7 +123,12 @@ class CommentsStateMachine @AssistedInject constructor(
                     }
                 }
 
-                // ── 点赞（乐观更新）──────────────────────────────────────
+                // ── 点赞（乐观更新，以服务端返回为准）────────────────────
+                // 服务端是盲翻转：它按自己的记录翻一次，用 action 回传结果。
+                // 所以本地先乐观置位是为了手感的即时反馈，最终值必须由
+                // action 决定——只信本地翻转的话，本地状态与服务端一旦脱节
+                // （请求超时、多端操作、上一次成功但响应丢失），后续每次点击
+                // 都会翻向与服务端相反的方向，表现为"点赞经常失败、偶尔成功"。
                 on<CommentsAction.ToggleLike> { action ->
                     val previous = snapshot.likeOverrides[action.commentId]
                     mutate {
@@ -133,7 +138,21 @@ class CommentsStateMachine @AssistedInject constructor(
                         )
                     }
                     runCatchingApi { network.toggleCommentLike(action.commentId) }.fold(
-                        onSuccess = { noChange() },
+                        onSuccess = { response ->
+                            // isActive 为 null 表示服务端返回了未知 action：
+                            // 保留乐观值，至少不比"猜一个方向"更糟
+                            val confirmed = response.isActive
+                            if (confirmed == null) {
+                                noChange()
+                            } else {
+                                mutate {
+                                    copy(
+                                        likeOverrides = likeOverrides +
+                                                (action.commentId to confirmed)
+                                    )
+                                }
+                            }
+                        },
                         onFailure = { e ->
                             logger.error(e) { "评论点赞失败，回滚" }
                             // 回滚到操作前的覆盖值（可能本来就没有）。
