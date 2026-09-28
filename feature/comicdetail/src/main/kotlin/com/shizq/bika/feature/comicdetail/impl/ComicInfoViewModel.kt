@@ -23,6 +23,7 @@ import dagger.assisted.AssistedInject
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -70,28 +71,48 @@ class ComicInfoViewModel @AssistedInject constructor(
 
     private val _episodes = MutableStateFlow(EpisodeListState.Empty)
 
-    /** 章节目录。一次性拉全后再交给 UI，不做"边滚边补"的渐进渲染。 */
+    /** 章节目录。边拉边显示：第一批到手即可阅读，整本齐了再收尾。 */
     val episodes: StateFlow<EpisodeListState> = _episodes.asStateFlow()
+
+    /** 正在进行的目录加载。重新加载时先取消上一次，避免两份结果互相覆盖。 */
+    private var catalogLoadJob: Job? = null
 
     init {
         loadEpisodeCatalog()
     }
 
     /**
-     * 拉全整本章节目录。
+     * 拉取整本章节目录。
      *
      * 走 [ChapterRepository.getCompleteChapterCatalog]（一次性、失败即抛）而不是
-     * 边拉边发的目录流：
+     * 边拉边发的目录流：目录页要么是完整目录、要么明确失败可重试，"少几十话的
+     * 列表" 比 "加载失败" 有害得多——用户会以为这本漫画就这么多话。
      *
-     * - 目录页要么是完整目录、要么明确失败可重试，"少几十话的列表" 比 "加载失败"
-     *   有害得多——用户会以为这本漫画就这么多话；
-     * - 不再依赖 LazyGrid 滚到底触发分页 append，翻页正确性不再押在滚动行为上。
+     * 但**加载过程**不再把用户按在整屏转圈上：仓库每拉到一个批次就回调一次，
+     * 这里立刻渲染出去。第一个网络来回就能看到前 20 话，而不是等整本齐活。
+     * 中途任何一页彻底失败或整体超时，仍然整个切到错误态、丢掉已到手的部分——
+     * "渐进出内容"和"绝不展示残缺目录"这两条并不冲突：前者是过程，后者是结论。
+     *
+     * @param forceRefresh 用户点重试时传 true，绕过仓库缓存强制重拉
      */
-    fun loadEpisodeCatalog() {
-        viewModelScope.launch {
+    fun loadEpisodeCatalog(forceRefresh: Boolean = false) {
+        catalogLoadJob?.cancel()
+        catalogLoadJob = viewModelScope.launch {
             _episodes.value = EpisodeListState(isLoading = true, sortOrder = episodeSortOrder)
             try {
-                val catalog = chapterRepository.getCompleteChapterCatalog(comicId)
+                val catalog = chapterRepository.getCompleteChapterCatalog(
+                    comicId = comicId,
+                    forceRefresh = forceRefresh,
+                    onProgress = { chapters ->
+                        loadedChapters = chapters
+                        _episodes.value = EpisodeListState(
+                            chapters = chapters.applySortOrder(episodeSortOrder),
+                            sortOrder = episodeSortOrder,
+                            isLoading = false,
+                            isLoadingMore = true,
+                        )
+                    },
+                )
                 loadedChapters = catalog.chapters
                 logger.info {
                     "章节目录加载完成: comicId=$comicId 共 ${catalog.chapters.size} 话 " +
@@ -99,11 +120,13 @@ class ComicInfoViewModel @AssistedInject constructor(
                 }
                 emitEpisodeState()
             } catch (e: CancellationException) {
+                // 主动取消上一次加载（或页面销毁）不算失败，状态由新一次加载接管
                 throw e
             } catch (e: Exception) {
                 logger.error(e) { "章节目录加载失败: comicId=$comicId" }
                 _episodes.value = EpisodeListState(
                     isLoading = false,
+                    isLoadingMore = false,
                     loadFailed = true,
                     sortOrder = episodeSortOrder,
                 )
@@ -120,14 +143,16 @@ class ComicInfoViewModel @AssistedInject constructor(
      */
     fun toggleEpisodeSortOrder() {
         episodeSortOrder = episodeSortOrder.toggled()
-        emitEpisodeState()
+        // 保留"还在拉"的标记：用户在加载过程中点排序，不该让进度提示消失
+        emitEpisodeState(isLoadingMore = _episodes.value.isLoadingMore)
     }
 
-    private fun emitEpisodeState() {
+    private fun emitEpisodeState(isLoadingMore: Boolean = false) {
         _episodes.value = EpisodeListState(
             chapters = loadedChapters.applySortOrder(episodeSortOrder),
             sortOrder = episodeSortOrder,
             isLoading = false,
+            isLoadingMore = isLoadingMore,
             loadFailed = false,
         )
     }

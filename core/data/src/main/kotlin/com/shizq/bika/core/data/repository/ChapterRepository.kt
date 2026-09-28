@@ -24,14 +24,25 @@ interface ChapterRepository {
     fun getChapterCatalog(comicId: String): Flow<ChapterCatalog>
 
     /**
-     * 一次性拉全整本章节目录，失败即抛。
+     * 一次性拉全整本章节目录，超时或失败即抛。
      *
      * 与 [getChapterCatalog] 的差别是**失败不降级**：目录页要么呈现完整目录、
      * 要么明确报错让用户重试，绝不展示"看起来齐了、其实少了几十话"的列表。
      * [getChapterCatalog] 那条流选择"记日志并保留已拉部分"，是给上下章导航用的——
      * 导航"知道一部分"比什么都不知道强，但把它当完整目录展示就是骗人。
+     *
+     * 翻页是并发发的，并且有整体时限：宁可快速失败让用户重试，也不让界面一直转圈。
+     *
+     * @param forceRefresh 绕过内存缓存强制重拉。用户点"重试"时必须传 true，
+     *   否则会命中缓存的旧快照，表现为"重试没反应"
+     * @param onProgress 每拉到一个批次回调一次当前已到手的章节（升序），
+     *   供目录页边拉边渲染。不关心进度可忽略
      */
-    suspend fun getCompleteChapterCatalog(comicId: String): ChapterCatalog
+    suspend fun getCompleteChapterCatalog(
+        comicId: String,
+        forceRefresh: Boolean = false,
+        onProgress: (List<Chapter>) -> Unit = {},
+    ): ChapterCatalog
 
     /**
      * 一次性取回指定漫画的全部章节（非分页、非 Flow）。

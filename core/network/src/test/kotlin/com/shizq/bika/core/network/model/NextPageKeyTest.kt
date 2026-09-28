@@ -158,4 +158,83 @@ class NextPageKeyTest {
                 .nextChapterPageKey(MAX_CHAPTER_LIST_PAGES - 1),
         )
     }
+
+    // ───────────────────────── estimateLastChapterPage ─────────────────────────
+    // 只决定"首批并发发多少页"，不参与终止判断。因此这些用例钉的是
+    // "宁可多估一页、也不要估窄"，而不是精确值。
+
+    private fun estimatePage(
+        total: Int,
+        pages: Int,
+        limit: Int = 20,
+        docCount: Int = 20,
+    ) = PageData(
+        total = total,
+        limit = limit,
+        page = 1,
+        pages = pages,
+        docs = List(docCount) { "ch$it" },
+    )
+
+    @Test
+    fun `按 total 规划并多探一页`() {
+        // 120 话 / 每页 20 → 6 页，+1 探测页 → 7
+        assertEquals(
+            7,
+            estimatePage(total = 120, pages = 6).estimateLastChapterPage(),
+        )
+    }
+
+    @Test
+    fun `limit 不可用时退回按本页条数估算`() {
+        // limit=0 是服务端偶发字段异常，用本页实际条数当每页容量
+        assertEquals(
+            6,
+            estimatePage(total = 100, pages = 5, limit = 0, docCount = 20)
+                .estimateLastChapterPage(),
+        )
+    }
+
+    @Test
+    fun `total 与 pages 不一致时取较大值`() {
+        // total 报小（40 → 2 页）而 pages 报 6：取大的才不会把批次规划得太窄
+        assertEquals(
+            7,
+            estimatePage(total = 40, pages = 6).estimateLastChapterPage(),
+        )
+        // 反过来 pages 报小也一样
+        assertEquals(
+            7,
+            estimatePage(total = 120, pages = 1).estimateLastChapterPage(),
+        )
+    }
+
+    @Test
+    fun `两者都不可用时只探一页`() {
+        // 规划不出来时退回最小批次，让批次自己一档一档往前推
+        assertEquals(
+            2,
+            estimatePage(total = 0, pages = 0).estimateLastChapterPage(),
+        )
+    }
+
+    @Test
+    fun `页码信息完全缺失时也能给出最小规划`() {
+        // total/pages/limit 全为 0 且本页为空：不能返回 0 页，
+        // 否则并发批次会退化成"一页都不发"而直接空手结束
+        assertEquals(
+            2,
+            estimatePage(total = 0, pages = 0, limit = 0, docCount = 0)
+                .estimateLastChapterPage(),
+        )
+    }
+
+    @Test
+    fun `估算结果不超过页数硬上限`() {
+        // total 虚高时不能据此发出上百个请求
+        assertEquals(
+            MAX_CHAPTER_LIST_PAGES,
+            estimatePage(total = 1_000_000, pages = 1).estimateLastChapterPage(),
+        )
+    }
 }

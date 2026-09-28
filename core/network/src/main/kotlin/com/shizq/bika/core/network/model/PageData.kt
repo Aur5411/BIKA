@@ -71,3 +71,38 @@ fun PageData<*>.nextChapterPageKey(requestedPage: Int): Int? = when {
  * 服务端异常（每页都返回非空且内容不重复）时给循环一个确定的终点。
  */
 const val MAX_CHAPTER_LIST_PAGES: Int = 60
+
+/**
+ * 按第一页响应估算"整本要拉到第几页"，用于决定首批并发发多少请求。
+ *
+ * 这个值**不参与终止判断**，只影响批次的宽度：
+ * - 估小了不影响正确性——后面每拉完一批就往前扩一档，只要还收到非空页就继续；
+ * - 估大了最多多花一批请求，遇到空页立刻收工。
+ *
+ * 所以这里可以放心地取 `total` 与 `pages` 算出来的**较大值**：两者都出现过报小，
+ * 取大的那个至少不会把批次规划得太窄。两者都不可用时退回"只探一页"，
+ * 让一档一档往前推自己收敛。
+ *
+ * 结果末尾 +1 是**探测页**：末页比 `limit` 短只是经验规律，不是硬边界
+ * （去重、服务端删条目都会让中间页变短），只有空页或重复页才算真的到底。
+ *
+ * @return 至少 2——第 1 页已经在手，至少要探一下第 2 页
+ */
+fun PageData<*>.estimateLastChapterPage(): Int {
+    val perPage = if (limit > 0) limit else docs.size
+    if (perPage <= 0) return MIN_ESTIMATED_LAST_PAGE
+
+    val byTotal = if (total > 0) (total + perPage - 1) / perPage else 0
+    val byPages = if (pages > 0) pages else 0
+    val estimated = maxOf(byTotal, byPages)
+    if (estimated <= 0) return MIN_ESTIMATED_LAST_PAGE
+
+    return (estimated + PROBE_PAGE_COUNT)
+        .coerceAtLeast(MIN_ESTIMATED_LAST_PAGE)
+        .coerceAtMost(MAX_CHAPTER_LIST_PAGES)
+}
+
+/** 多探一页，用来确认真的到底了。 */
+private const val PROBE_PAGE_COUNT = 1
+
+private const val MIN_ESTIMATED_LAST_PAGE = 2

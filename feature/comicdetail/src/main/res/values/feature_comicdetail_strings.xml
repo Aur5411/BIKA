@@ -20,7 +20,12 @@
     <string name="episode_sort_ascending">正序</string>
     <string name="episode_sort_descending">倒序</string>
     <string name="episode_scroll_to_top">回到顶部</string>
+    <string name="episode_scroll_to_bottom">回到底部</string>
+    <string name="episode_loading_more">正在加载剩余章节…</string>
     <string name="episode_total_count">共 %1$d 话</string>
+    <string name="episode_loaded_count">已加载 %1$d 话</string>
+    <string name="episode_order_ascending">第 1 话在前</string>
+    <string name="episode_order_descending">最新话在前</string>
     <string name="tag_block_title">屏蔽标签</string>
     <string name="tag_block_message">确认屏蔽标签“%1$s”吗？屏蔽后，所有含有此标签的漫画将不再展示在列表中。</string>
     <string name="tag_blocked">已屏蔽标签“%1$s”</string>

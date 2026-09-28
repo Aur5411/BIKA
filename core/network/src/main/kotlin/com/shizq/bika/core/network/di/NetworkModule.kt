@@ -43,8 +43,22 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.serialization.json.Json
 import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
+
+/**
+ * API 域名的并发请求上限。
+ *
+ * OkHttp 默认 `maxRequestsPerHost = 5`。章节目录是并发翻页，批次宽度就受它约束：
+ * 调大这里才能让批次继续变宽，否则多出来的请求只会在队列里排队。
+ * 取 8 而不是更大：翻页通常只占 5 个，留出余量给同时发出的详情/评论请求，
+ * 也不至于对服务端形成过强的瞬时压力（那反而会招来限流、把加载搞失败）。
+ */
+private const val MAX_REQUESTS_PER_HOST = 8
+
+/** 全局并发上限，保持 OkHttp 默认值，只在同域名上限之外再兜一层。 */
+private const val MAX_REQUESTS = 64
 
 
 @Module
@@ -122,6 +136,10 @@ internal object NetworkModule {
      * suspend 的凭据读取与重登，会阻塞 OkHttp dispatcher 线程；并发 401 时
      * 多个线程互等且重登请求抢不到同 host 的请求配额，形成死锁。
      * Ktor 拦截器天生 suspend，不占请求配额，这类问题不复存在。
+     *
+     * `Dispatcher` 显式配置是为了把"同域名并发上限"这件事写在台面上：它是并发
+     * 翻页的真实天花板（章节目录的批次宽度就按它取值）。默认值 5 会被翻页
+     * 独占，同时发出的详情/评论请求只能排队，所以留出余量。
      */
     @Provides
     @Singleton
@@ -132,6 +150,12 @@ internal object NetworkModule {
         OkHttpClient.Builder()
             .connectionPool(connectionPool)
             .dns(directDns)
+            .dispatcher(
+                Dispatcher().apply {
+                    maxRequests = MAX_REQUESTS
+                    maxRequestsPerHost = MAX_REQUESTS_PER_HOST
+                }
+            )
             .build()
     }
 

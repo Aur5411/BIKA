@@ -71,7 +71,8 @@ fun ComicDetailScreen(
         onAuthorClick = onAuthorClick,
         onUploaderClick = onUploaderClick,
         onToggleEpisodeSortOrder = viewModel::toggleEpisodeSortOrder,
-        onRetryEpisodeLoad = viewModel::loadEpisodeCatalog,
+        // 重试必须绕过缓存：否则会命中上一次失败前写下的旧快照，点"重试"看起来没反应
+        onRetryEpisodeLoad = { viewModel.loadEpisodeCatalog(forceRefresh = true) },
     )
 }
 

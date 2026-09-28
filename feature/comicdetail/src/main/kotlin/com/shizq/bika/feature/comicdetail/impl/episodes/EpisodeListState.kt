@@ -36,15 +36,16 @@ fun List<Chapter>.applySortOrder(order: ChapterSortOrder): List<Chapter> = when 
 /**
  * 章节目录页的完整状态。
  *
- * 做成一个 [Immutable] 容器而不是拆成多个 StateFlow：目录是**一次性拉全**的，
- * 状态机只有「加载中 → 成功 / 失败」三种落脚点。拆开之后列表、排序、失败标记
+ * 做成一个 [Immutable] 容器而不是拆成多个 StateFlow：拆开之后列表、排序、失败标记
  * 会各自触发一轮重组，长目录下这类重复重组肉眼可见。
  *
- * @param chapters 当前展示顺序下的完整章节列表。**一定保证是完整的**：
- *   不做"先给一部分、边滚边补"的渐进渲染，避免出现"看起来齐了其实少一截"
+ * @param chapters 当前已到手的章节（按 [sortOrder] 排好）。
+ *   加载中是**渐进增长**的：第一个网络来回回来就有前 20 话，后面逐批补齐
  * @param sortOrder 当前排序方式
- * @param isLoading 加载尚未结束
- * @param loadFailed 加载失败（含中途某页重试耗尽）。此时 [chapters] 为空，
+ * @param isLoading 一批都还没到手。界面应显示整屏加载，而不是先说"没有章节"
+ * @param isLoadingMore 已有内容、后续批次还在路上。界面在列表末尾提示"正在加载剩余章节"，
+ *   而不是把用户按在整屏转圈上等
+ * @param loadFailed 加载失败（含单页重试耗尽、整体超时）。此时 [chapters] 为空，
  *   界面应给出重试入口，而不是展示一个残缺列表
  */
 @Immutable
@@ -52,6 +53,7 @@ data class EpisodeListState(
     val chapters: List<Chapter> = emptyList(),
     val sortOrder: ChapterSortOrder = ChapterSortOrder.ASCENDING,
     val isLoading: Boolean = true,
+    val isLoadingMore: Boolean = false,
     val loadFailed: Boolean = false,
 ) {
     companion object {
