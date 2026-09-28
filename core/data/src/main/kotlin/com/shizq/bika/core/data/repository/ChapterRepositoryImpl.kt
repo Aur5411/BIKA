@@ -16,6 +16,7 @@ import com.shizq.bika.core.network.BikaDataSource
 import com.shizq.bika.core.network.model.Episode
 import com.shizq.bika.core.network.model.MAX_CHAPTER_LIST_PAGES
 import com.shizq.bika.core.network.model.PageData
+import com.shizq.bika.core.network.model.declaredChapterTotal
 import com.shizq.bika.core.network.model.estimateLastChapterPage
 import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.inject.Inject
@@ -384,7 +385,9 @@ class ChapterRepositoryImpl @Inject constructor(
                     onPageError(page, e)
                     return expectedTotal
                 }
-                if (eps.total > expectedTotal) expectedTotal = eps.total
+                // 空页里的 total 是垃圾值，不能拿它抬自报总数——否则会把
+                // "9 话的漫画"算成 10 话，凭空推出一个不存在的下一章
+                expectedTotal = declaredChapterTotal(expectedTotal, eps)
 
                 val currentPageIds = eps.docs.mapTo(LinkedHashSet()) { it.id }
                 // 与上一页逐字相同 = 服务端把越界页 clamp 回了上一页

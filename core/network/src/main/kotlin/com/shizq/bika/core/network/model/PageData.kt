@@ -73,6 +73,34 @@ fun PageData<*>.nextChapterPageKey(requestedPage: Int): Int? = when {
 const val MAX_CHAPTER_LIST_PAGES: Int = 60
 
 /**
+ * 用某一页的响应更新"服务端自报的章节总数"。
+ *
+ * ## 只认返回了条目的页
+ *
+ * 服务端对越界/无效页码返回的**空页，里面的 `total` / `pages` 是垃圾值**。
+ * 实测一本 9 话的漫画：
+ *
+ * ```
+ * 第 1 页：收到 9 条（page=1 total=9 pages=1 limit=40，首条 order=9）
+ * 第 2 页：收到 0 条（page=2 total=10 pages=1 limit=40，首条 order=null）  ← 空页谎报 total
+ * ```
+ *
+ * 拿空页的 `total` 当真会连锁出两个症状：
+ * 1. 自报总数被抬到 10，而目录只有 9 条 → `已收到 < 自报总数` 恒成立，
+ *    于是把空页当"可疑终止信号"反复往后探（白花 3 个请求），最后仍然
+ *    把目录判成 `isComplete = false`；
+ * 2. 更糟的是上下章导航会据此认为"第 9 话的下一话确实存在"，凭空推出
+ *    一个**幻影章节 10**，阅读器把「下一章」点亮，点进去是不存在的章节。
+ *
+ * 所以空页只用来判断"到底了"，不参与总数统计。
+ *
+ * @param current 已累计的自报总数
+ * @return 更新后的自报总数
+ */
+fun declaredChapterTotal(current: Int, page: PageData<*>): Int =
+    if (page.docs.isEmpty()) current else maxOf(current, page.total)
+
+/**
  * 按第一页响应估算"整本要拉到第几页"，用于决定首批并发发多少请求。
  *
  * 这个值**不参与终止判断**，只影响批次的宽度：

@@ -9,13 +9,14 @@ import kotlin.test.assertTrue
 /**
  * [navigationAt] 的上下章判定。
  *
- * 这里钉的是本次修复的核心：**"还有没有下一话"由 order + 服务端自报总数决定，
- * 不能只看"目录里恰好有没有这一条"**。后者在目录还在加载、或服务端把长目录截断时
- * 会让 `next` 变成 null，阅读器据此把「下一章」按钮置灰——按顺序明明还有下一话。
+ * 两条铁律，各自都有反面用例守着：
  *
- * 两条防线配合工作：
- * 1. [fillMissingLeadingOrders] 把中断的 order 区间补完整（覆盖开头缺失的情形）；
- * 2. [navigationAt] 在目录仍然缺那一条时按 order 推导（覆盖尾部缺失的情形）。
+ * 1. **上一章可以按 order 推导**：目录还在加载、或服务端把长目录截断了（截掉的
+ *    正是最老的那几十话）时，`order - 1` 那一话确实存在，不能让「上一章」置灰；
+ * 2. **下一章只能来自目录里真实存在的条目**：服务端按"最新话在前"分页，目录的
+ *    最大 order 就是最新一话，不存在更靠后的章节。曾经按 `order + 1 <= total`
+ *    推导，结果在一本服务端自报 total 偏大的漫画上，给最后一话点亮了指向
+ *    不存在章节的「下一章」。
  */
 class ChapterNavigationTest {
 
@@ -57,16 +58,6 @@ class ChapterNavigationTest {
     }
 
     @Test
-    fun `目录尾部缺失时按 order 推导出下一章`() {
-        // 服务端自报 200 话，目录只拉到 160：读第 160 话时按顺序还有 161
-        val nav = truncatedCatalog(declaredTotal = 200).navigationAt(order = 160)
-
-        assertEquals(161, nav.next?.order)
-        assertEquals("synthetic-order-161", nav.next?.id)
-        assertEquals("第 161 話", nav.next?.title)
-    }
-
-    @Test
     fun `目录开头缺失时按 order 推导出上一章`() {
         // 自报总数 5，目录只给到 3..5：读第 3 话时按顺序前面还有 2
         val catalog = ChapterCatalog(
@@ -80,31 +71,65 @@ class ChapterNavigationTest {
         assertEquals("synthetic-order-2", nav.prev?.id)
     }
 
+    /**
+     * 回归用例，形状直接取自用户日志：
+     *
+     * ```
+     * 第 1 页：收到 9 条（total=9，首条 order=9）    ← 真实数据
+     * 第 2 页：收到 0 条（total=10，首条 order=null） ← 空页谎报 total
+     * 加载完成 共 9 话 (isComplete=false)
+     * ```
+     *
+     * 自报总数被空页抬到 10，旧实现据此认为"第 9 话的下一话存在"，推出幻影
+     * 第 10 话并点亮「下一章」。
+     */
     @Test
-    fun `补齐区间后下一章就是 order 加一`() {
-        // 截断目录先补齐 1..70，再求导航：读第 60 话，下一章必须是 61 而不是跳到 71
-        val filled = truncatedCatalog().fillMissingLeadingOrders(expectedTotal = 160)
+    fun `空页谎报总数时不会推出幻影下一章`() {
+        val polluted = ChapterCatalog(
+            chapters = (1..9).map { chapter(it) },
+            isComplete = false,
+            declaredTotal = 10,
+        )
 
-        assertEquals(160, filled.chapters.size)
-        assertEquals(61, filled.navigationAt(order = 60).next?.order)
+        assertNull(
+            polluted.navigationAt(order = 9).next,
+            "目录最大 order 就是最新话，不该推导出第 10 话",
+        )
+        // 更老的那一侧照常：第 1 话依然没有上一章
+        assertNull(polluted.navigationAt(order = 1).prev)
     }
 
     @Test
-    fun `目录还在加载时下一章也能立刻算出来`() {
-        // 第一页刚回来只有最新的 30 话，补齐成 1..160 之后读第 5 话，下一章是 6
+    fun `下一章永远来自目录已存在的条目`() {
+        // 目录只拉到 131..160，读第 120 话（不在目录里）
+        val partial = ChapterCatalog(
+            chapters = (131..160).map { chapter(it) },
+            isComplete = false,
+            declaredTotal = 160,
+        )
+
+        // 给出的是目录里最近的一条真实章节，而不是按 order+1 补出来的合成条目
+        val next = partial.navigationAt(order = 120).next
+        assertEquals(131, next?.order)
+        assertEquals("id-131", next?.id)
+
+        // 目录里有的就正常给
+        assertEquals(132, partial.navigationAt(order = 131).next?.order)
+
+        // 目录最大 order 之后再无下一章可推
+        assertNull(partial.navigationAt(order = 160).next)
+    }
+
+    @Test
+    fun `目录还在加载时上一章也能立刻算出来`() {
+        // 第一页刚回来只有最新的 30 话，补齐成 1..160 之后读第 5 话，上一章是 4
         val loading = ChapterCatalog(
             chapters = (131..160).map { chapter(it) },
             isComplete = false,
             declaredTotal = 160,
         ).fillMissingLeadingOrders(expectedTotal = 160)
 
-        assertEquals(6, loading.navigationAt(order = 5).next?.order)
-    }
-
-    @Test
-    fun `order 超出自报总数时不推导`() {
-        // 总数不可信地报小（实测会发生）：已无依据，退回"目录里没有就没有"
-        assertNull(truncatedCatalog(declaredTotal = 160).navigationAt(order = 200).next)
+        assertEquals(4, loading.navigationAt(order = 5).prev?.order)
     }
 
     @Test
@@ -122,14 +147,11 @@ class ChapterNavigationTest {
 
     @Test
     fun `isResolved 仍然只反映目录是否拉全`() {
-        // 推导出相邻章节不等于目录拉全了，这个标记不能跟着变
         assertFalse(truncatedCatalog(declaredTotal = 200).navigationAt(order = 160).isResolved)
         assertTrue(fullCatalog(to = 10).navigationAt(order = 5).isResolved)
     }
 
     // ───────────────────────── 首尾边界 ─────────────────────────
-    // 边界完全由 order 与自报总数判掉，不依赖目录里有没有那一条。
-    // 而且边界判定要在"目录没拉全"的前提下也成立——这正是原先出问题的地方。
 
     @Test
     fun `目录没拉全时第一话依然没有上一章`() {
@@ -147,7 +169,6 @@ class ChapterNavigationTest {
 
     @Test
     fun `目录没拉全时最后一话依然没有下一章`() {
-        // 读到底那一话：order 已达自报总数，不能再推导出第 161 话
         assertNull(truncatedCatalog(declaredTotal = 160).navigationAt(order = 160).next)
     }
 

@@ -112,9 +112,13 @@ object BikaLog {
     /**
      * 供设置页「查看 / 导出系统日志」使用的文件。
      *
-     * 有崩溃记录时**合并导出**（崩溃栈 + 主日志尾部）：只给其中一份都不够用——
-     * 崩溃栈说明了死在哪，而崩溃前的业务日志说明了当时在做什么。没有崩溃记录时
-     * 退回 log4j 的主日志，再退回最近一天的滚动文件。null 表示确实没有任何日志。
+     * 有崩溃记录时**合并导出**：只给其中一份都不够用——崩溃栈说明了死在哪，
+     * 而崩溃前的业务日志说明了当时在做什么。没有崩溃记录时退回 log4j 的主日志，
+     * 再退回最近一天的滚动文件。null 表示确实没有任何日志。
+     *
+     * **顺序是"运行日志在前、崩溃记录在后"**：设置页的查看器会截断成最后 2000 行
+     * （见 SettingsViewModel.getLogsContent），把崩溃段放在前面正好会被截掉——
+     * 而它恰恰是用户导出日志的唯一目的。
      */
     fun getLogFile(): File? {
         val dir = logsDir ?: return null
@@ -132,10 +136,10 @@ object BikaLog {
         return try {
             val export = dir.resolve(EXPORT_LOG_FILE_NAME)
             export.bufferedWriter().use { writer ->
-                writer.append("===== 崩溃记录 (crash.log) =====\n")
-                writer.append(crash.readText())
-                writer.append("\n===== 运行日志尾部 (app.log) =====\n")
+                writer.append("===== 运行日志尾部 (app.log) =====\n")
                 writer.append(readTail(main, MAX_EXPORT_MAIN_BYTES))
+                writer.append("\n===== 崩溃记录 (crash.log) =====\n")
+                writer.append(crash.readText())
             }
             export
         } catch (e: Exception) {

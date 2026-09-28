@@ -237,4 +237,37 @@ class NextPageKeyTest {
             estimatePage(total = 1_000_000, pages = 1).estimateLastChapterPage(),
         )
     }
+
+    // ───────────────────── declaredChapterTotal ─────────────────────
+    // 自报总数只认"返回了条目"的页：空页里的 total 是垃圾值，
+    // 拿它当真会凭空推出一个不存在的下一章（详见函数文档里的日志片段）。
+
+    private fun totalPage(total: Int, docCount: Int) = PageData(
+        total = total,
+        limit = 40,
+        page = 1,
+        pages = 1,
+        docs = List(docCount) { "ch$it" },
+    )
+
+    @Test
+    fun `有数据的页照常抬高自报总数`() {
+        assertEquals(72, declaredChapterTotal(current = 0, page = totalPage(72, 40)))
+        assertEquals(76, declaredChapterTotal(current = 72, page = totalPage(76, 36)))
+    }
+
+    @Test
+    fun `空页的 total 被忽略（回归：9 话被算成 10 话）`() {
+        // 用户日志里的真实形状：首页 total=9，越界空页却报 total=10
+        val afterFirstPage = declaredChapterTotal(current = 0, page = totalPage(9, 9))
+        assertEquals(9, afterFirstPage)
+
+        val afterEmptyPage = declaredChapterTotal(current = afterFirstPage, page = totalPage(10, 0))
+        assertEquals(9, afterEmptyPage, "空页的 total 不能抬高自报总数")
+    }
+
+    @Test
+    fun `空页不会把自报总数从零凭空变成有值`() {
+        assertEquals(0, declaredChapterTotal(current = 0, page = totalPage(10, 0)))
+    }
 }

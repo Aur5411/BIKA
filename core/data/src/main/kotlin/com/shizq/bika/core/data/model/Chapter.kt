@@ -64,44 +64,57 @@ data class ChapterNavigation(
 /**
  * 求当前章节的上下章。
  *
- * ## 为什么缺的那一条也要给出来
+ * ## 为什么缺的那一条也要给出来（只针对**上一章**）
  *
- * 原先只在"目录里恰好有 order 更大的那一条"时才认为有下一章。但目录有两种情况
- * 会缺条目：**还在加载**，或者**服务端把长目录截断了**（实测 160 话只给 90 话）。
- * 这两种情况下 `next` 都是 null，阅读器据此把「下一章」按钮置灰——明明按顺序
- * 还有下一话，却点不动；自动衔接章节也跟着失效。
+ * 原先只在"目录里恰好有 order 更小的那一条"时才认为有上一章。但目录有两种情况
+ * 会缺条目：**还在加载**，或者**服务端把长目录截断了**（实测 160 话只给 90 话，
+ * 截掉的正是最老的几十话）。这两种情况下 `prev` 都是 null，阅读器据此把
+ * 「上一章」置灰——明明前面还有，却点不动。
  *
- * 章节 order 是连续整数，"下一章"就是 `order + 1`，这件事**不需要等目录**：
+ * 章节 order 是连续整数，"上一章"就是 `order - 1`，这件事**不需要等目录**：
  * 只要服务端自报的章节总数 [ChapterCatalog.declaredTotal] 说明这一话确实存在，
  * 就按 order 把它补出来。
  *
+ * ## 为什么不推导**下一章**
+ *
+ * 服务端按"**最新话在前**"分页（实测：72 话的漫画第 1 页首条就是 order=72），
+ * 所以目录里的**最大 order 就是最新一话**，不存在比它更新的章节。也就是说
+ * `order > 目录最大 order` 时，"下一章"在构造上就不可能存在——唯一能支持相反
+ * 结论的证据只有服务端自报的 `total`，而它被实测证明会说谎：
+ *
+ * ```
+ * 9 话的漫画：第 1 页（真实数据）total=9，第 2 页（空页）total=10
+ * ```
+ *
+ * 曾经的实现按 `order + 1 <= declaredTotal` 推下一章，于是这本 9 话的漫画在
+ * 第 9 话也把「下一章」点亮，指向一个**不存在的第 10 话**，点进去必然失败。
+ * 现在下一章一律只认目录里真实存在的那一条。
+ *
  * ## 首尾边界
  *
- * 边界一律由 `order` 与总数决定，不依赖目录里有没有条目：
+ * 边界同样由 `order` 决定，不依赖目录里有没有条目：
  * - 第一话（`order == 1`）没有上一章：`order - 1 == 0`，直接给 null；
- * - 最后一话（`order == declaredTotal`）没有下一章：`order + 1` 超出自报总数，给 null。
+ * - 最新一话：目录里没有更大的 order，`next` 为 null。
  *
  * ## 目录拉全后不再推导
  *
- * [ChapterCatalog.isComplete] 为 true 时目录本身就是权威，此时**一律不推导**，
- * 相邻章节只从目录里查。否则服务端 `total` 虚高（实测会发生）时会凭空多出一话
- * 并不存在的"下一章"，用户点进去只会看到加载失败。
- *
+ * [ChapterCatalog.isComplete] 为 true 时目录本身就是权威，此时**一律不推导**。
  * 服务端连总数都没给时（`declaredTotal <= 0`）同样退回原行为，不影响下载模式等场景。
  */
 fun ChapterCatalog.navigationAt(order: Int): ChapterNavigation = ChapterNavigation(
-    prev = chapters.lastOrNull { it.order < order } ?: synthesizedNeighbor(order - 1),
-    next = chapters.firstOrNull { it.order > order } ?: synthesizedNeighbor(order + 1),
+    prev = chapters.lastOrNull { it.order < order } ?: synthesizedPrev(order - 1),
+    // 不推导：目录最大 order 就是最新话，order 更大的一话不存在
+    next = chapters.firstOrNull { it.order > order },
     isResolved = isComplete,
 )
 
 /**
- * 按 order 推一个相邻章节。
+ * 按 order 推一个**更老**的章节。
  *
  * 三重前提缺一不可：目录**没拉全**（否则目录说了算）、服务端**给了总数**、
- * 而且目标 order 确实落在 1..总数 之内（首尾边界就是靠最后这条判掉的）。
+ * 而且目标 order 落在 1..总数 之内（第一话的边界就是靠最后这条判掉的）。
  */
-private fun ChapterCatalog.synthesizedNeighbor(candidateOrder: Int): Chapter? {
+private fun ChapterCatalog.synthesizedPrev(candidateOrder: Int): Chapter? {
     if (isComplete) return null
     if (candidateOrder < 1) return null
     if (declaredTotal <= 0 || candidateOrder > declaredTotal) return null
