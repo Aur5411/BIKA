@@ -51,10 +51,10 @@ data class PreloadRequest(
  * `IMAGE_MAX_REQUESTS_PER_HOST`）留出余量：预载、当前可见页、进度条预览图
  * 共用那一个额度，预载只该占其中一部分，否则会把"用户正在看的那一张"挤到后面。
  *
- * 取 4：足以持续把预载窗口喂满，同时给可见页留下大部分额度。原先是 2——
- * 且因为 [PreloadQueue] 当时给了默认值、这里没传参，那个 2 是隐形的。
+ * 取 5：足以持续把预载窗口喂满，同时给可见页留下大部分额度（同域名上限 16）。
+ * 原先是 2——且因为 [PreloadQueue] 当时给了默认值、这里没传参，那个 2 是隐形的。
  */
-private const val PRELOAD_CONCURRENCY = 4
+private const val PRELOAD_CONCURRENCY = 5
 
 internal class CoilPreloadRequestEnqueuer(
     context: Context,
