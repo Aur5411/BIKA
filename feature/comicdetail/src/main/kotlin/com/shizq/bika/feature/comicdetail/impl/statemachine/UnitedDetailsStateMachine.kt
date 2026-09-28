@@ -18,9 +18,11 @@ import com.shizq.bika.feature.comicdetail.impl.toComicSummaryList
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Clock
 
 class UnitedDetailsStateMachine @AssistedInject constructor(
@@ -40,7 +42,18 @@ class UnitedDetailsStateMachine @AssistedInject constructor(
                             val detailDeferred =
                                 async { network.getComicDetails(comicId).toComicDetail() }
                             val recommendationsDeferred = async {
-                                network.getRecommendations(comicId).toComicSummaryList()
+                                // 推荐属于详情页下方的附加内容，不能无限期阻塞首屏。
+                                // 服务器慢或暂时不可用时，先展示详情，推荐留空即可。
+                                try {
+                                    withTimeoutOrNull(RECOMMENDATIONS_TIMEOUT_MS) {
+                                        network.getRecommendations(comicId).toComicSummaryList()
+                                    }.orEmpty()
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Recommendations unavailable; showing detail without them", e)
+                                    emptyList()
+                                }
                             }
                             detailDeferred.await() to recommendationsDeferred.await()
                         }
@@ -131,6 +144,7 @@ class UnitedDetailsStateMachine @AssistedInject constructor(
     }
 
     private companion object {
+        private const val RECOMMENDATIONS_TIMEOUT_MS = 1_500L
         const val ACTION_LIKE = ActionData.ACTION_LIKE
         const val ACTION_UNLIKE = ActionData.ACTION_UNLIKE
         const val ACTION_FAVORITE = ActionData.ACTION_FAVORITE
