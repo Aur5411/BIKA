@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -23,7 +22,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.VerticalAlignTop
-import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -194,10 +192,11 @@ fun EpisodesPage(
 /**
  * 正序 / 倒序切换。
  *
- * 用带文字的 ExtendedFAB 而不是纯图标：纯图标下"点完到底生效没有"完全看不出来
- * （图标只是翻了个方向，很容易被当成没反应）。文字直接写明当前顺序，
- * 点一下就能看到「正序」变「倒序」，状态是否生效一目了然。
- * 配色与下载按钮完全一致，仍是同一族的悬浮按钮。
+ * 纯图标 FAB，与下面的下载按钮同款同尺寸，三个悬浮按钮排成一列不显得突兀。
+ * 状态靠图标本身表达：翻转时把"排序"图标转 180°，方向即当前顺序。
+ *
+ * 图标不依赖"点完有没有反应"来判断是否生效，因此 [contentDescription] 必须写明
+ * 当前顺序——它是读屏与自动化测试唯一能拿到状态的出口（界面上没有文字了）。
  */
 @Composable
 private fun SortOrderButton(
@@ -205,39 +204,29 @@ private fun SortOrderButton(
     onClick: () -> Unit,
 ) {
     val isDescending = sortOrder == ChapterSortOrder.DESCENDING
-    // 翻转时把"排序"图标转 180°：同一套图标下方向即语义
+    // 方向即语义：正序朝上、倒序朝下，翻转动画让"点了一下"肉眼可见
     val iconRotation by animateFloatAsState(
         targetValue = if (isDescending) 180f else 0f,
         label = "episodeSortIconRotation"
     )
 
-    ExtendedFloatingActionButton(
+    FloatingActionButton(
         onClick = onClick,
         containerColor = MaterialTheme.colorScheme.primaryContainer,
-        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-        icon = {
-            Icon(
-                imageVector = Icons.AutoMirrored.Filled.Sort,
-                // 文字已经把当前顺序说清楚了，图标不重复念一遍
-                contentDescription = null,
-                modifier = Modifier
-                    .size(20.dp)
-                    .rotate(iconRotation)
-            )
-        },
-        text = {
-            Text(
-                text = stringResource(
-                    if (isDescending) {
-                        R.string.episode_sort_descending
-                    } else {
-                        R.string.episode_sort_ascending
-                    }
-                ),
-                style = MaterialTheme.typography.labelLarge
-            )
-        },
-    )
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+    ) {
+        Icon(
+            imageVector = Icons.AutoMirrored.Filled.Sort,
+            contentDescription = stringResource(
+                if (isDescending) {
+                    R.string.episode_sort_descending
+                } else {
+                    R.string.episode_sort_ascending
+                }
+            ),
+            modifier = Modifier.rotate(iconRotation)
+        )
+    }
 }
 
 @Preview(showBackground = true, name = "Episodes Page Preview")
