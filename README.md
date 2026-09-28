@@ -1,7 +1,7 @@
 # BIKA · 个人修改版
 
-基于 [STlxx-lin/BIKA](https://github.com/STlxx-lin/BIKA) 修改（上游 [shizq123/BIKA](https://github.com/shizq123/BIKA)）。
-这里只记录本修改版的功能改动，原项目介绍请看上游仓库。
+基于 [shizq123/BIKA](https://github.com/shizq123/BIKA) 修改。
+这里只记录本修改版的功能改动，原项目介绍请看原仓库。
 
 ## ⚠️ 关于软件更新
 
@@ -10,8 +10,7 @@
 
 **本仓库不提供更新**，需要新版本请前往原仓库：
 
-- STlxx-lin/BIKA — https://github.com/STlxx-lin/BIKA （原更新检查指向的就是它）
-- shizq123/BIKA — https://github.com/shizq123/BIKA （更上游的原仓库）
+**https://github.com/shizq123/BIKA**
 
 ## 版本与成品包
 
