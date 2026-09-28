@@ -177,33 +177,6 @@ internal object NetworkModule {
             .build()
     }
 
-    @Provides
-    @Singleton
-    @GithubClient
-    fun provideGithubHttpClient(
-        connectionPool: ConnectionPool,
-    ): HttpClient = HttpClient(OkHttp) {
-        engine {
-            preconfigured = OkHttpClient.Builder()
-                .connectionPool(connectionPool)
-                .build()
-        }
-        install(ContentNegotiation) {
-            json(
-                Json {
-                    ignoreUnknownKeys = true
-                    coerceInputValues = true
-                }
-            )
-        }
-        if (BuildConfig.DEBUG) {
-            install(Logging) {
-                logger = Logger.ANDROID
-                level = LogLevel.HEADERS
-            }
-        }
-    }
-
     /**
      * DNS 解析专用 [HttpClient]：独立于主链路，不带鉴权、不走 DirectDns，
      * 避免"解析直连 IP 却依赖直连 IP"的循环依赖。短超时快速失败。

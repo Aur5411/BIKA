@@ -5,7 +5,6 @@ package com.shizq.bika.core.datastore.serializer
 import androidx.datastore.core.CorruptionException
 import androidx.datastore.core.Serializer
 import com.shizq.bika.core.datastore.di.DataStoreModule.DataStoreJson
-import com.shizq.bika.core.datastore.model.UpdatePreference
 import com.shizq.bika.core.datastore.model.UserCredentials
 import com.shizq.bika.core.model.preferences.UserPreferences
 import com.shizq.bika.core.model.preferences.UserProfileSnapshot
@@ -87,24 +86,4 @@ internal object UserProfileCacheSerializer : Serializer<UserProfileSnapshot> {
 
     override val defaultValue: UserProfileSnapshot
         get() = UserProfileSnapshot()
-}
-
-internal object UpdatePreferencesSerializer : Serializer<UpdatePreference> {
-    override suspend fun readFrom(input: InputStream): UpdatePreference {
-        try {
-            return DataStoreJson.decodeFromStream(UpdatePreference.serializer(), input)
-        } catch (e: Exception) {
-            throw CorruptionException("Failed to decode data", e)
-        }
-    }
-
-    override suspend fun writeTo(
-        t: UpdatePreference,
-        output: OutputStream
-    ) {
-        DataStoreJson.encodeToStream(UpdatePreference.serializer(), t, output)
-    }
-
-    override val defaultValue: UpdatePreference
-        get() = UpdatePreference()
 }

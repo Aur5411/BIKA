@@ -89,7 +89,6 @@ import coil3.request.crossfade
 import com.shizq.bika.R
 import com.shizq.bika.core.data.model.DetailedReadingHistory
 import com.shizq.bika.core.model.FavoriteTag
-import com.shizq.bika.feature.settings.impl.update.ui.UpdateHost
 import com.shizq.bika.navigation.DiscoveryAction
 import com.shizq.bika.ui.feed.FavoriteTagsDrawer
 import kotlinx.coroutines.delay
@@ -120,8 +119,6 @@ fun DashboardScreen(
             onDismiss = { viewModel.dispatch(DashboardAction.DismissCheckInResult) },
         )
     }
-
-    UpdateHost()
 
     DashboardContent(
         state = state,

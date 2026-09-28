@@ -1,13 +1,13 @@
 package com.shizq.bika.core.data.di
 
-import com.shizq.bika.core.data.repository.AppUpdateRepository
-import com.shizq.bika.core.data.repository.AppUpdateRepositoryImpl
 import com.shizq.bika.core.data.repository.ChapterRepository
 import com.shizq.bika.core.data.repository.ChapterRepositoryImpl
 import com.shizq.bika.core.data.repository.CommentsRepository
 import com.shizq.bika.core.data.repository.CommentsRepositoryImpl
 import com.shizq.bika.core.data.repository.DashboardRepository
 import com.shizq.bika.core.data.repository.DashboardRepositoryImpl
+import com.shizq.bika.core.data.repository.LeaderboardRepository
+import com.shizq.bika.core.data.repository.LeaderboardRepositoryImpl
 import com.shizq.bika.core.data.repository.UserRepository
 import com.shizq.bika.core.data.repository.UserRepositoryImpl
 import dagger.Binds
@@ -26,11 +26,11 @@ internal abstract class DataModule {
 
     @Binds
     @Singleton
-    abstract fun bindAppUpdateRepository(impl: AppUpdateRepositoryImpl): AppUpdateRepository
+    abstract fun bindChapterRepository(impl: ChapterRepositoryImpl): ChapterRepository
 
     @Binds
     @Singleton
-    abstract fun bindChapterRepository(impl: ChapterRepositoryImpl): ChapterRepository
+    abstract fun bindLeaderboardRepository(impl: LeaderboardRepositoryImpl): LeaderboardRepository
 
     @Binds
     @Singleton

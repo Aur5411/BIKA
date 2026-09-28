@@ -6,11 +6,10 @@ import androidx.lifecycle.viewModelScope
 import com.shizq.bika.core.coroutine.FlowRestarter
 import com.shizq.bika.core.coroutine.restartable
 import com.shizq.bika.core.data.model.User
-import com.shizq.bika.core.data.model.asExternalModel
+import com.shizq.bika.core.data.repository.LeaderboardRepository
 import com.shizq.bika.core.database.dao.ReadingHistoryDao
 import com.shizq.bika.core.datastore.UserPreferencesDataSource
 import com.shizq.bika.core.model.ComicSummary
-import com.shizq.bika.core.network.BikaDataSource
 import com.shizq.bika.core.result.Result
 import com.shizq.bika.core.result.asResult
 import com.shizq.bika.util.injectLocalStatusFrom
@@ -20,11 +19,12 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltViewModel
 class LeaderboardViewModel @Inject constructor(
-    private val api: BikaDataSource,
+    private val leaderboardRepository: LeaderboardRepository,
     private val historyDao: ReadingHistoryDao,
     private val userPreferencesDataSource: UserPreferencesDataSource,
 ) : ViewModel() {
@@ -32,19 +32,18 @@ class LeaderboardViewModel @Inject constructor(
 
     val scrollStates = List(4) { LazyListState() }
 
-    // 网络数据：一次性加载（排行榜数据本身不需要轮询）
-    private val rawLeaderboardFlow = combine(
-        getLeaderboard(TIME_H24),
-        getLeaderboard(TIME_D7),
-        getLeaderboard(TIME_D30),
-        getKnightLeaderboardFlow(),
-    ) { daily, weekly, monthly, knights ->
-        AllLeaderboards(
-            dailyComics = daily,
-            weeklyComics = weekly,
-            monthlyComics = monthly,
-            knightUsers = knights
-        )
+    /**
+     * 榜单数据。
+     *
+     * 走 [LeaderboardRepository] 而不是直接打接口，是为了拿到缓存：
+     * 榜单数据以小时为粒度变化，用户却是"看几眼 → 进漫画 → 返回"的用法，
+     * 每次都重新请求四个接口，返回时就要再转一次圈。
+     *
+     * 这里不传 forceRefresh：命中缓存时零请求返回、缓存过期时自动重拉，
+     * 只有用户主动刷新（[refresh]）才强制绕过缓存。
+     */
+    private val rawLeaderboardFlow = flow {
+        emit(leaderboardRepository.getLeaderboards())
     }
 
     val leaderboardUiState = combine(
@@ -112,24 +111,25 @@ class LeaderboardViewModel @Inject constructor(
             }
         }.stateIn(
             scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5_000),
+            // Lazily 而不是 WhileSubscribed(5s)：后者在用户进入漫画详情、离开本页
+            // 超过 5 秒后会取消上游，返回时重新订阅 → 重新走一遍 Loading，
+            // 于是"从漫画返回榜单"必然闪一次转圈。这个页面活在导航栈上时
+            // 数据本就该留着，也省掉一次无意义的重新请求。
+            started = SharingStarted.Lazily,
             initialValue = LeaderboardUiState.Loading
         )
 
+    /**
+     * 用户主动刷新（刷新按钮 / 出错重试）。
+     *
+     * 先让仓库缓存失效，再重启数据流，保证这一次一定打到网络，
+     * 而不是又被缓存挡回来。
+     */
     fun refresh() {
-        leaderboardRestarter.restart()
-    }
-
-    private fun getKnightLeaderboardFlow() = flow {
-        val response = api.getKnightLeaderboard()
-        val users = response.users.map { it.asExternalModel() }
-        emit(users)
-    }
-
-    private fun getLeaderboard(timeType: String) = flow {
-        val response = api.getLeaderboard(timeType)
-        // 这里只发射原始网络数据，本地状态由上层 combine + DB Flow 注入
-        emit(response.comics)
+        viewModelScope.launch {
+            leaderboardRepository.invalidate()
+            leaderboardRestarter.restart()
+        }
     }
 
     private data class AllLeaderboards(
@@ -139,10 +139,6 @@ class LeaderboardViewModel @Inject constructor(
         val knightUsers: List<User>
     )
 }
-
-private const val TIME_H24 = "H24"
-private const val TIME_D7 = "D7"
-private const val TIME_D30 = "D30"
 
 sealed interface LeaderboardUiState {
     data class Success(
