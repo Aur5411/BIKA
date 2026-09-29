@@ -90,9 +90,9 @@ fun ReadingSettingsBottomSheet(
                                     )
                                 )
                             },
-                            valueRange = 1f..16f,
-                            // steps 计算公式：(max - min) - 1。这里 (16 - 1) - 1 = 14
-                            steps = 14,
+                            valueRange = 1f..24f,
+                            // steps 计算公式：(max - min) - 1。这里 (24 - 1) - 1 = 22
+                            steps = 22,
                             modifier = Modifier.weight(1f)
                         )
 

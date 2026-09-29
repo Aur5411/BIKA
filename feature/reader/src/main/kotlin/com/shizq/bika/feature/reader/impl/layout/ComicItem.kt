@@ -50,6 +50,7 @@ import androidx.paging.compose.LazyPagingItems
 import coil3.compose.AsyncImagePainter
 import coil3.compose.LocalPlatformContext
 import coil3.compose.rememberAsyncImagePainter
+import coil3.compose.rememberConstraintsSizeResolver
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
 import coil3.request.crossfade
@@ -280,10 +281,22 @@ fun ComicPageItem(
     } else {
         ContentScale.FillWidth
     }
+    // 按画布尺寸解码，而不是按文件原始尺寸。
+    //
+    // AsyncImagePainter 在 `defined.sizeResolver == null` 时会兜底成
+    // `SizeResolver.ORIGINAL`（见 coil3/compose/AsyncImagePainter.updateRequest），
+    // 于是扫描分辨率是 2000×3000 的页图也会被解成同尺寸的 Bitmap——单张 20MB 起步，
+    // 解码时间跟着像素数线性增长。这就是"下载完了图还待一会儿"的那段时间，
+    // 也是翻页时内存曲线突然抬高的原因。
+    //
+    // 采样只砍掉超出画布的冗余像素：常规页图本就在屏幕宽度附近，几乎 1:1 无损；
+    // 真正被降采样的只有那些远大于屏幕的扫描件。
+    val sizeResolver = rememberConstraintsSizeResolver()
     var imageAspectRatio by remember(page.id) { mutableFloatStateOf(0.75f) }
-    val imageRequest = remember(platformContext, page.url) {
+    val imageRequest = remember(platformContext, page.url, sizeResolver) {
         ImageRequest.Builder(platformContext)
             .data(page.url)
+            .size(sizeResolver)
             .crossfade(false)
             .diskCacheKey(page.url)
             .diskCachePolicy(CachePolicy.ENABLED)
@@ -317,7 +330,9 @@ fun ComicPageItem(
             painter = painter,
             contentDescription = "Page ${index + 1}",
             contentScale = contentScale,
-            modifier = Modifier.fillMaxSize()
+            // sizeResolver 同时是 LayoutModifier：挂在这里才能读到真实画布约束，
+            // 进而算出该用多大的采样率去解这一页。
+            modifier = Modifier.fillMaxSize().then(sizeResolver)
         )
         when (state) {
             is AsyncImagePainter.State.Loading -> {

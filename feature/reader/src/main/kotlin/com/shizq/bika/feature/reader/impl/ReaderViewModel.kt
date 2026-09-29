@@ -17,6 +17,7 @@ import com.shizq.bika.core.data.repository.ChapterRepository
 import com.shizq.bika.core.data.repository.DownloadRepository
 import com.shizq.bika.core.database.model.DownloadStatus
 import com.shizq.bika.core.download.repository.DownloadTaskRepository
+import com.shizq.bika.core.network.image.ImageConnectionWarmup
 import com.shizq.bika.feature.reader.impl.progress.AwaitDataRestoreStrategy
 import com.shizq.bika.feature.reader.impl.progress.ProgressConfig
 import com.shizq.bika.feature.reader.impl.progress.ReadingProgressManager
@@ -50,6 +51,7 @@ class ReaderViewModel @AssistedInject constructor(
     private val chapterRepository: ChapterRepository,
     private val downloadRepository: DownloadRepository,
     private val downloadTaskRepository: DownloadTaskRepository,
+    private val imageConnectionWarmup: ImageConnectionWarmup,
     readerStateMachine: ReaderStateMachine,
     progressStore: ReadingProgressStore,
     @Assisted id: String,
@@ -87,6 +89,10 @@ class ReaderViewModel @AssistedInject constructor(
         // 把切章写入接到流水线上。必须在 launchIn 之前完成，否则第一次
         // JumpToChapter 可能落到 NoOp 上。
         readerStateMachine.progressWriteCoordinator = progressManager
+
+        // 趁还在拉章节表就把图片源的 TLS 握手付掉：一次握手 1 秒上下，
+        // 等第一页该显示时再做就有肉眼可见的空窗。
+        viewModelScope.launch { imageConnectionWarmup.warmUp() }
     }
 
     private val stateMachine = readerStateMachine.launchIn(viewModelScope)

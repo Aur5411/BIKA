@@ -7,6 +7,9 @@ import coil3.request.ErrorResult
 import coil3.request.ImageResult
 import coil3.request.SuccessResult
 import coil3.size.Dimension
+import com.shizq.bika.core.network.image.ImageHostRouter
+import com.shizq.bika.core.network.image.ImageHosts
+import com.shizq.bika.core.network.image.ImageRateGovernor
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -26,8 +29,17 @@ import kotlin.time.Duration.Companion.milliseconds
 
 private val logger = KotlinLogging.logger("DomainFallbackCoil")
 
-/** 主请求慢于此值就启动降级竞速。 */
-private const val SLOW_MAIN_THRESHOLD_MS = 2500L
+/**
+ * 主请求慢于此值就启动降级竞速。
+ *
+ * 原先 2500ms：一张图要白等两秒半才去找更快的源，而阅读器一次翻页就是一整屏，
+ * 用户看到的就是"每页都要转两秒圈"。900ms 足够判断"这个源不快"（正常命中
+ * CDN 的首字节在几百毫秒内），又不至于在网络抖动时误判成慢源、无谓地多打几条连接。
+ *
+ * 配合 [com.shizq.bika.core.network.image.ImageHostRouter]：第一张图竞速选出的源
+ * 会被记住，之后的图直接走它，这个等待只发生在会话的头一两张图上。
+ */
+private const val SLOW_MAIN_THRESHOLD_MS = 900L
 
 /**
  * 小图（头像、列表缩略图）的判定上限（较长边，单位 px）。
@@ -52,24 +64,51 @@ private fun Throwable?.isWorthFallback(): Boolean {
     return code >= 500
 }
 
+/**
+ * 429/503 是"服务端被打得太狠"的回执，属于**暂时性**失败。
+ *
+ * 它与上面的 4xx 判定相反：此时换域名只会更快烧光配额（配额通常按 IP/账号算，
+ * 与访问哪个节点无关），真正有用的是停下来等窗口过去——这件事由外层
+ * [com.shizq.bika.core.network.image.ImageThrottleInterceptor] 负责。
+ */
+private fun Throwable?.isThrottled(): Boolean {
+    if (this !is coil3.network.HttpException) return false
+    val code = response.code
+    return code == 429 || code == 503
+}
+
 internal class FallbackMarker : AbstractCoroutineContextElement(FallbackMarker) {
     companion object Key : CoroutineContext.Key<FallbackMarker>
 }
 
 @OptIn(ExperimentalCoilApi::class)
-class DomainFallbackInterceptor : Interceptor {
+class DomainFallbackInterceptor(
+    /** 竞速决出的胜者写进这里，供后续图片请求直接换源（见 PreferredHostInterceptor）。 */
+    private val hostRouter: ImageHostRouter,
+    /** 被服务端限流时的全局闸门：限流期间不再并发打其他域名。 */
+    private val governor: ImageRateGovernor,
+) : Interceptor {
     @Volatile
     private var optimalFallbackHost: String? = null
+
+    /** 记录一次胜出：既更新本类的快速通道，也更新全局最快源。 */
+    private fun rememberWinner(host: String) {
+        optimalFallbackHost = host
+        hostRouter.remember(host)
+    }
 
     /**
      * 降级槽位。
      *
      * 原先是 2：评论页一屏十几个头像、详情页同时拉封面与章节图时，
      * 槽位瞬间占满，后面的请求全部阻塞在 `withPermit` 上——
-     * 这才是"图片加载很慢"的放大器。竞速本身最多打 6 个域名，
-     * 给到 6 个槽位既够用、又不会形成无界并发。
+     * 这才是"图片加载很慢"的放大器。
+     *
+     * 取 12：候选池有 8 个域名，一次竞速最多同时打 8 条，12 个槽位保证
+     * "一整屏图片同时降级"也不会互相排队；再往上没有意义——槽位不是并发收益，
+     * 只是排队许可，真正的并发上限由图片 OkHttp 的 `maxRequestsPerHost` 决定。
      */
-    private val fallbackSlots = Semaphore(6)
+    private val fallbackSlots = Semaphore(12)
 
     /**
      * 判断是否小图。
@@ -107,7 +146,7 @@ class DomainFallbackInterceptor : Interceptor {
         }
         val failedHost = httpUrl.host
 
-        if (failedHost !in DomainConfig.MANAGED_HOSTS) {
+        if (failedHost !in ImageHosts.MANAGED_HOSTS) {
             return@coroutineScope chain.proceed()
         }
 
@@ -142,13 +181,22 @@ class DomainFallbackInterceptor : Interceptor {
         }
 
         if (earlyResult is ErrorResult) {
+            // 被限流：不要竞速。此时并发打其余 7 个候选域名只会把剩余配额更快地
+            // 烧掉——配额通常按 IP/账号计，与走到哪个节点无关。登记一次退避后把
+            // 结果原样交给外层 ImageThrottleInterceptor，由它等窗口过去重试同一张图。
+            if (earlyResult.throwable.isThrottled()) {
+                val code = (earlyResult.throwable as coil3.network.HttpException).response.code
+                governor.noteThrottled(code)
+                logger.debug { "主域名 '$failedHost' 返回 $code（限流），等待退避后重试: $originalUrl" }
+                return@coroutineScope earlyResult
+            }
             if (!earlyResult.throwable.isWorthFallback()) {
                 // 404 特殊处理：依次（串行、非并发）尝试候选域名直到成功，
                 // 优先已知最优域名，避免并发风暴的同时覆盖“真404但换个镜像能取到”的场景。
                 val throwable = earlyResult.throwable
                 if (throwable is coil3.network.HttpException && throwable.response.code == 404) {
                     val currentOptimal = optimalFallbackHost
-                    val candidateHosts = DomainConfig.MANAGED_HOSTS
+                    val candidateHosts = ImageHosts.MANAGED_HOSTS
                         .filter { it != failedHost }
                         .sortedByDescending { it == currentOptimal }
 
@@ -156,7 +204,7 @@ class DomainFallbackInterceptor : Interceptor {
                         logger.debug { "404 依次尝试候选域名: $candidateHost" }
                         val fallbackResult = tryFallbackHost(chain, httpUrl, candidateHost)
                         if (fallbackResult != null) {
-                            optimalFallbackHost = candidateHost
+                            rememberWinner(candidateHost)
                             return@coroutineScope fallbackResult
                         }
                     }
@@ -165,6 +213,9 @@ class DomainFallbackInterceptor : Interceptor {
                 logger.warn(earlyResult.throwable) { "永久性失败，跳过降级: ${chain.request.data}" }
                 return@coroutineScope earlyResult
             }
+            // 主源失败：它可能正是"记住的最快源"，此时必须忘掉它，
+            // 否则后续每张图都会被 PreferredHostInterceptor 改写到这个坏源上。
+            hostRouter.forget(failedHost)
             logger.warn { "主域名 '$failedHost' 请求失败，开始降级竞速" }
         }
 
@@ -189,7 +240,7 @@ class DomainFallbackInterceptor : Interceptor {
         failedHost: String,
         sequential: Boolean,
     ): ImageResult? {
-        val fallbackHosts = DomainConfig.MANAGED_HOSTS.filter { it != failedHost }
+        val fallbackHosts = ImageHosts.imageHosts.filter { it != failedHost }
         if (fallbackHosts.isEmpty()) return null
 
         // 策略 1: Fast Path (快速通道)
@@ -200,6 +251,7 @@ class DomainFallbackInterceptor : Interceptor {
             val fastResult = tryFallbackHost(chain, httpUrl, currentOptimal)
             if (fastResult != null) {
                 logger.info { "快速通道命中: $currentOptimal" }
+                rememberWinner(currentOptimal)
                 return fastResult
             }
             // 失效即清空：否则这个域名一旦挂掉，后续每张图都要先白等它 3 秒超时。
@@ -216,7 +268,7 @@ class DomainFallbackInterceptor : Interceptor {
         if (sequential) {
             for (host in hostsToRace) {
                 val result = tryFallbackHost(chain, httpUrl, host) ?: continue
-                optimalFallbackHost = host
+                rememberWinner(host)
                 return result
             }
             return null
@@ -255,7 +307,7 @@ class DomainFallbackInterceptor : Interceptor {
         var winnerResult: SuccessResult? = null
 
         for (msg in resultChannel) {
-            optimalFallbackHost = msg.first
+            rememberWinner(msg.first)
             winnerResult = msg.second
             logger.info { "竞速获胜域名: '${msg.first}'" }
             break
@@ -297,18 +349,3 @@ class DomainFallbackInterceptor : Interceptor {
     }
 }
 
-private object DomainConfig {
-    val imageDomains = listOf(
-        "https://s3.picacomic.com",
-        "https://s2.picacomic.com",
-        "https://storage.diwodiwo.xyz",
-        "https://storage1.picacomic.com",
-        "https://storage.tipatipa.xyz",
-        "https://www.picacomic.com",
-        "https://storage-b.picacomic.com",
-    )
-
-    val MANAGED_HOSTS: Set<String> by lazy(LazyThreadSafetyMode.NONE) {
-        imageDomains.map { it.toHttpUrl().host }.toSet()
-    }
-}

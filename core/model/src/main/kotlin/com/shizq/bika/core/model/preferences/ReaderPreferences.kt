@@ -16,7 +16,16 @@ data class ReaderPreferences(
     val tapZoneLayout: TapZoneLayout = TapZoneLayout.Sides,
     @SerialName("volumeKeyNavigation")
     val volumeKeyNavigationEnabled: Boolean = true,
-    val preloadCount: Int = 2,
+    /**
+     * 基准预载张数。
+     *
+     * 取 8 而不是 2：阅读器是"翻页即出图"的场景，预载 2 页意味着连翻三页就
+     * 开始露加载态。8 页的原图约 8~24MB，一次章节阅读完全吃得下；
+     * 精读与扫读还会在此基础上自适应调整（见 AdaptivePreloadPolicy）。
+     *
+     * 改这个只影响新安装/清过数据的默认值，老用户保留自己的设置值。
+     */
+    val preloadCount: Int = 8,
     val eyeCare: EyeCareConfig = EyeCareConfig(),
     val autoScroll: AutoScrollConfig = AutoScrollConfig(),
     val bookSpreadsMode: BookSpreadsMode = BookSpreadsMode.AUTO,

@@ -51,10 +51,14 @@ data class PreloadRequest(
  * `IMAGE_MAX_REQUESTS_PER_HOST`）留出余量：预载、当前可见页、进度条预览图
  * 共用那一个额度，预载只该占其中一部分，否则会把"用户正在看的那一张"挤到后面。
  *
- * 取 5：足以持续把预载窗口喂满，同时给可见页留下大部分额度（同域名上限 16）。
- * 原先是 2——且因为 [PreloadQueue] 当时给了默认值、这里没传参，那个 2 是隐形的。
+ * 取 12：扫读时预载窗口是 16 页（见 AdaptivePreloadPolicy），并发低于窗口宽度
+ * 时窗口根本喂不满——排在窗口末尾的页要等前面的下完才开始，翻到那里就露加载态。
+ * 12 与窗口同量级，同时给可见页、进度条预览留下大部分额度（同域名上限 32）。
+ *
+ * 原先是 2——且因为 [PreloadQueue] 当时给了默认值、这里没传参，那个 2 是隐形的；
+ * 后来提到 5，仍小于窗口宽度 10，是"窗口调大了但没跟着调并发"的残留。
  */
-private const val PRELOAD_CONCURRENCY = 5
+private const val PRELOAD_CONCURRENCY = 12
 
 internal class CoilPreloadRequestEnqueuer(
     context: Context,
