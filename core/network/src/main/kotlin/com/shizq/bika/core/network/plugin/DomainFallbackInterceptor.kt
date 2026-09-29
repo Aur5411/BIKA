@@ -191,17 +191,19 @@ class DomainFallbackInterceptor(
                 return@coroutineScope earlyResult
             }
             if (!earlyResult.throwable.isWorthFallback()) {
-                // 404 特殊处理：依次（串行、非并发）尝试候选域名直到成功，
-                // 优先已知最优域名，避免并发风暴的同时覆盖“真404但换个镜像能取到”的场景。
+                // 403/404 也要按“当前源不可用”处理：不同图片源的防盗链、节点
+                // 同步状态可能不同。之前只有 404 会串行换源，最快源返回 403 后就
+                // 直接把失败交给 UI，后续重试仍可能再次命中同一个坏源。
                 val throwable = earlyResult.throwable
-                if (throwable is coil3.network.HttpException && throwable.response.code == 404) {
+                val statusCode = (throwable as? coil3.network.HttpException)?.response?.code
+                if (statusCode == 403 || statusCode == 404) {
                     val currentOptimal = optimalFallbackHost
                     val candidateHosts = ImageHosts.MANAGED_HOSTS
                         .filter { it != failedHost }
                         .sortedByDescending { it == currentOptimal }
 
                     for (candidateHost in candidateHosts) {
-                        logger.debug { "404 依次尝试候选域名: $candidateHost" }
+                        logger.debug { "$statusCode 依次尝试候选域名: $candidateHost" }
                         val fallbackResult = tryFallbackHost(chain, httpUrl, candidateHost)
                         if (fallbackResult != null) {
                             rememberWinner(candidateHost)

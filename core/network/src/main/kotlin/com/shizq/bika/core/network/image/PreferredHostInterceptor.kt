@@ -1,6 +1,8 @@
 package com.shizq.bika.core.network.image
 
 import coil3.intercept.Interceptor
+import coil3.network.HttpException
+import coil3.request.ErrorResult
 import coil3.request.ImageResult
 import io.github.oshai.kotlinlogging.KotlinLogging
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -37,12 +39,24 @@ internal class PreferredHostInterceptor(
 
         return try {
             logger.debug { "改用最快源: ${originalUrl.host} -> $preferred" }
-            chain.withRequest(rewritten).proceed()
+            val result = chain.withRequest(rewritten).proceed()
+            if (result is ErrorResult) {
+                // Coil 将 HTTP 失败作为 ErrorResult 返回，不会抛异常。
+                // 之前这里只 catch Exception，导致坏源返回 403/404 后仍被记为最快源，
+                // 后续每页和手动重试都会继续命中同一个坏源。
+                router.forget(preferred)
+                val status = (result.throwable as? HttpException)?.response?.code
+                logger.warn { "最快源 $preferred 返回失败${status?.let { " HTTP $it" } ?: ""}，清除选路记录" }
+                // 不能把这个失败直接交给 UI：本次请求还没尝试原始 fileServer
+                // 和其它镜像。沿原始 URL 再走一次后置降级链，确保点击重试前就有
+                // 机会换到可用源。
+                return chain.proceed()
+            }
+            result
         } catch (e: Exception) {
-            // 最快源失效了：清掉记录，本张图立刻回退到原域名，
-            // 由后面的降级拦截器决定要不要重新竞速。
+            // 网络异常同样清掉记录；DomainFallbackInterceptor 会接管换源竞速。
             router.forget(preferred)
-            logger.warn(e) { "最快源 $preferred 失效，回退 ${originalUrl.host}" }
+            logger.warn(e) { "最快源 $preferred 失效，清除选路记录" }
             chain.proceed()
         }
     }
