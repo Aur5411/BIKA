@@ -403,6 +403,21 @@ fun ComicPageItem(
 
             is AsyncImagePainter.State.Error -> {
                 // 退避重试逻辑已提到 when 之外，这里只负责 UI
+                //
+                // 失败详情直接显示在屏幕上（而不是只写日志）：用户截图就能把
+                // 「真实 URL + 域名 + 具体错误」带回来，不必接 adb 抓 logcat。
+                // 对"某几页固定加载不出来"这类问题，这三项是定位的全部所需。
+                val errorText = remember(state) {
+                    val t = (state as? AsyncImagePainter.State.Error)?.result?.throwable
+                    val host = page.url.substringAfter("://").substringBefore("/")
+                    buildString {
+                        append("加载失败\n点击重试")
+                        append("\n—")
+                        append("\n第 ${index + 1} 页")
+                        append("\nhost: $host")
+                        append("\n${t?.let { it::class.simpleName } ?: "未知"}: ${t?.message?.take(120)}")
+                    }
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -418,10 +433,10 @@ fun ComicPageItem(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(imageVector = Icons.Default.Refresh, contentDescription = "Retry")
                         Text(
-                            text = "加载失败\n点击重试",
+                            text = errorText,
                             textAlign = TextAlign.Center,
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.padding(top = 8.dp)
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                         )
                     }
                 }

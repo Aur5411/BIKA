@@ -10,6 +10,7 @@ import coil3.size.Dimension
 import com.shizq.bika.core.network.image.ImageHostRouter
 import com.shizq.bika.core.network.image.ImageHosts
 import com.shizq.bika.core.network.image.ImageRateGovernor
+import com.shizq.bika.core.network.image.isChapterImagePath
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -146,9 +147,29 @@ class DomainFallbackInterceptor(
         }
         val failedHost = httpUrl.host
 
-        if (failedHost !in ImageHosts.MANAGED_HOSTS) {
+        // 准入用「路径是不是 /static/ 章节图」而不是「host 认不认识」。
+        //
+        // 旧实现是 `if (failedHost !in ImageHosts.MANAGED_HOSTS) return proceed()`，
+        // 这带来一个致命盲区：**API 返回的 fileServer 一旦是列表外的新节点，
+        // 该图的换源能力就被整体关掉**——主源不通时连一个镜像都不会去试，
+        // 用户看到的就是"某几页固定加载失败"。而服务端新增存储节点是常事，
+        // 失败页也正好固定在那几页。
+        //
+        // 改为按路径判定后，任何来源的章节图都能进入降级链。
+        if (!httpUrl.isChapterImagePath()) {
             return@coroutineScope chain.proceed()
         }
+
+        // 候选池里除当前 host 之外的全部镜像。空则无从降级，原样放行。
+        val candidateHosts = ImageHosts.MANAGED_HOSTS.filter { it != failedHost }
+        if (candidateHosts.isEmpty()) {
+            return@coroutineScope chain.proceed()
+        }
+
+        // 是否为已知受管域名：决定降级时用"并发竞速"还是"串行兜底"。
+        // 非受管域名（来路不明，可能并非图片存储节点）只做串行尝试，
+        // 不对它一口气打 8 条连接。
+        val isManaged = failedHost in ImageHosts.MANAGED_HOSTS
 
         // 小图：只等主域名，不竞速。失败交由上层退避重试。
         val diskPreload = chain.request.decoderFactory is BlackholeDecoder.Factory
@@ -197,12 +218,8 @@ class DomainFallbackInterceptor(
                 val throwable = earlyResult.throwable
                 val statusCode = (throwable as? coil3.network.HttpException)?.response?.code
                 if (statusCode == 403 || statusCode == 404) {
-                    val currentOptimal = optimalFallbackHost
-                    val candidateHosts = ImageHosts.MANAGED_HOSTS
-                        .filter { it != failedHost }
-                        .sortedByDescending { it == currentOptimal }
-
-                    for (candidateHost in candidateHosts) {
+                    val ordered = candidateHosts.sortedByDescending { it == optimalFallbackHost }
+                    for (candidateHost in ordered) {
                         logger.debug { "$statusCode 依次尝试候选域名: $candidateHost" }
                         val fallbackResult = tryFallbackHost(chain, httpUrl, candidateHost)
                         if (fallbackResult != null) {
@@ -222,7 +239,16 @@ class DomainFallbackInterceptor(
         }
 
         val fallbackRequest = async {
-            performFallbackRace(chain, httpUrl, failedHost, sequential = diskPreload)
+            // 非受管域名（不在候选池里、通常也不是图片存储节点）不参与并发竞速：
+            // 对一个来路不明的域名一口气打 8 条连接，收益不确定而请求量翻倍。
+            // 但仍要走串行兜底，否则"主源不通 + 域名不在白名单"就真的无路可退
+            // ——那正是此前"某几页固定失败"的成因。
+            performFallbackRace(
+                chain,
+                httpUrl,
+                failedHost,
+                sequential = diskPreload || !isManaged,
+            )
         }
         // Keep observing the primary while mirrors run. Previously a completed primary
         // waited for the entire mirror race (and sometimes another timeout) to finish.

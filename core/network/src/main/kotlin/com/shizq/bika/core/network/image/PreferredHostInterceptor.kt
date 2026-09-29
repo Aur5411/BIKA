@@ -5,9 +5,19 @@ import coil3.network.HttpException
 import coil3.request.ErrorResult
 import coil3.request.ImageResult
 import io.github.oshai.kotlinlogging.KotlinLogging
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 private val logger = KotlinLogging.logger("PreferredHost")
+
+/**
+ * 是不是章节页图（`/static/...`）。
+ *
+ * 这是 [PreferredHostInterceptor] 区分"该换源的图"与"不该碰的图"的判据。
+ * 用路径而不是域名白名单，理由见 intercept 内的说明。
+ */
+internal fun HttpUrl.isChapterImagePath(): Boolean =
+    encodedPath.startsWith("/static/")
 
 /**
  * 把图片请求改写到已知最快的源。
@@ -27,11 +37,24 @@ internal class PreferredHostInterceptor(
         val originalUrl = (chain.request.data as? String)?.toHttpUrlOrNull()
             ?: return chain.proceed()
 
-        // 非受管域名（头像 CDN、本地文件、用户头像 base64 等）不碰
-        if (originalUrl.host !in ImageHosts.MANAGED_HOSTS) return chain.proceed()
+        // 用「路径长什么样」而不是「host 认不认识」做准入。
+        //
+        // 旧实现是 `if (host !in MANAGED_HOSTS) return proceed()`，于是 API 返回
+        // 候选池之外的新 fileServer 时，这张图既不会被改写到已知可用源、也不会
+        // 进入降级链——彻底失去换源能力。而服务端新增存储节点恰恰是常事，
+        // 表现就是固定几页图永远加载不出来。
+        //
+        // 改用路径判定后，既保住了"头像 CDN / 本地文件 / base64 不碰"的原意
+        // （它们的路径名不是 /static/），又让任何来源的章节图都能被换源。
+        // 改动只换 host、path 与 query 原样保留——各镜像是同一份存储的入口，
+        // /static/{path} 在哪个域名下都指向同一张图。
+        if (!originalUrl.isChapterImagePath()) return chain.proceed()
 
         val preferred = router.preferredHost() ?: return chain.proceed()
         if (preferred == originalUrl.host) return chain.proceed()
+        // 只会是候选池里的域名（只有竞速/串行胜者才会 remember），
+        // 这里再挡一道防御性检查，避免将来有别的写入路径把非法值塞进来。
+        if (preferred !in ImageHosts.MANAGED_HOSTS) return chain.proceed()
 
         val rewritten = chain.request.newBuilder()
             .data(originalUrl.newBuilder().host(preferred).build().toString())
