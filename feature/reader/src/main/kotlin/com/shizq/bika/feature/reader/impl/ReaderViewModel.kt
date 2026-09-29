@@ -32,6 +32,7 @@ import dagger.assisted.AssistedInject
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterIsInstance
@@ -110,14 +111,45 @@ class ReaderViewModel @AssistedInject constructor(
     // 只从 Ready 状态派生：Initializing 阶段 initialPage 尚未从数据库查出（固定为占位值），
     // 若把它也纳入 key，会在 Initializing -> Ready 转换时把 (order, 占位值) 和
     // (order, 真实值) 当成两个不同的 key，导致启动时多打一次浪费的网络请求。
-    private val chapterPagesResultFlow = stateMachine.state
+    //
+    // ## 为什么额外挂一个 [retrySignal]
+    //
+    // 这是一个真实存在过的"重试也没有用"的根因：`shareIn` 只是把上游**已经发射过**
+    // 的 PagingData 缓存下来重放，它没有重新订阅上游的能力。一旦分页数据层失败
+    // （REFESH 失败即首屏打不开、append 失败即读到分页边界时再也拉不到下一页），
+    // Paging 会把该 PagingSource 置为 Error 并停止；此后 `pageItems.retry()`
+    // 能修好的只是 Paging 内部那一份数据，而 composition 里持有的
+    // `imageListFlow` 仍是**失败前那一份**缓存。也就是：
+    //
+    // - 重试后它内部确实重拉了一页，但 UI 收到的永远是同一个陈旧快照；
+    // - 而用户真正会遇到的触发点就是分页边界——章节约第 20 页之后正好落在
+    //   第一个 40 张图分页块的尾部，那里正是 append 的边界。
+    //
+    // 把 [retrySignal] 并入 flatMapLatest 的 key：重试信号自增即重建整条分页流
+    // （重新 getChapterPages → 重新订阅），这才是真正意义上的重载。
+    private val retrySignal = MutableStateFlow(0)
+
+    private val chapterPagesKeyFlow = stateMachine.state
         .filterIsInstance<ReaderUiState.Ready>()
-        .map { state -> state.chapter.order to state.chapter.initialPage }
+        .map { state -> Triple(state.chapter.order, state.chapter.initialPage, retrySignal.value) }
         .distinctUntilChanged()
-        .map { (chapterOrder, initialPage) ->
+
+    private val chapterPagesResultFlow = chapterPagesKeyFlow
+        .map { (chapterOrder, initialPage, _) ->
             chapterRepository.getChapterPages(id, chapterOrder, initialPage)
         }
         .shareIn(viewModelScope, SharingStarted.Lazily, replay = 1)
+
+    /**
+     * 重新加载当前章节的分页数据（分页失败后由 UI 触发）。
+     *
+     * 与 `pageItems.retry()` 的分工：那个只修 Paging 内部的数据副本，这个负责让
+     * composition 收到一份新的 PagingData。两者都要有，缺哪个都会留下
+     * "点了重试没反应"或"重试完图表还是错的"这类半边修复。
+     */
+    fun reloadChapterPages() {
+        retrySignal.value += 1
+    }
 
     // 图片列表流：下载模式读取本地文件，在线模式从网络加载
     val imageListFlow: Flow<PagingData<ChapterPage>> =
@@ -214,6 +246,14 @@ class ReaderViewModel @AssistedInject constructor(
             stateMachine.dispatch(action)
         }
     }
+
+    /**
+     * 分页失败后由 UI 触发的重载入口，见 [reloadChapterPages]。
+     *
+     * 与 `pageItems.retry()` 一起使用：那个让 Paging 重拉当前失败的那一页，
+     * 这个让 composition 收到重建后的分页流。
+     */
+    fun retryPages() = reloadChapterPages()
 
     @AssistedFactory
     interface Factory {

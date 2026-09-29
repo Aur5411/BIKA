@@ -31,6 +31,14 @@ interface PreloadRequestEnqueuer {
         requests: List<PreloadRequest>,
         visibleRequests: List<PreloadRequest> = emptyList(),
     )
+
+    /**
+     * 队列因"窗口内无可用数据"而落空的累计次数。
+     *
+     * 用于让上层发现"预载饿死"（见 [PreloadQueue.starvationCount]）并主动推动
+     * Paging 续拉，而不是被动等用户滑到那里才第一次请求。
+     */
+    val starvationCount: Int
 }
 
 /**
@@ -96,6 +104,15 @@ internal class CoilPreloadRequestEnqueuer(
             retainRunning = visibleRequests.mapTo(mutableSetOf(), PreloadRequest::key),
         )
     }
+
+    /**
+     * 预载窗口是否因为"窗口内的页还取不到数据"而一次次落空。
+     *
+     * 见 [PreloadQueue.starvationCount]：这不是预载失败，而是窗口越过了 Paging
+     * 已加载范围的边界，此时队列空转、无人去准备用户即将看到的那些页。
+     * 上层据此主动催一次续拉。
+     */
+    override val starvationCount: Int get() = queue.starvationCount
 
     fun close() = queue.close()
 }

@@ -96,6 +96,7 @@ fun ReaderScreen(viewModel: ReaderViewModel = hiltViewModel(), onBackClick: () -
         progressManager = viewModel.progressManager,
         onBackClick = onBackClick,
         dispatch = viewModel::dispatch,
+        onReloadPages = viewModel::retryPages,
     )
 }
 
@@ -109,6 +110,7 @@ private fun ReaderContent(
     progressManager: ReadingProgressManager,
     onBackClick: () -> Unit = {},
     dispatch: (ReaderAction) -> Unit = {},
+    onReloadPages: () -> Unit = {},
 ) {
     when (state) {
         is ReaderUiState.Initializing -> FullScreenLoading()
@@ -119,6 +121,7 @@ private fun ReaderContent(
             progressManager = progressManager,
             onBackClick = onBackClick,
             dispatch = dispatch,
+            onReloadPages = onReloadPages,
         )
     }
 }
@@ -132,6 +135,7 @@ private fun ReaderReadyContent(
     progressManager: ReadingProgressManager,
     onBackClick: () -> Unit,
     dispatch: (ReaderAction) -> Unit,
+    onReloadPages: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -181,7 +185,7 @@ private fun ReaderReadyContent(
     // 之前这里、章节自动衔接、进度跟踪、恢复确认各 collect 一次同一个冷
     // snapshotFlow，等于四个协程各跑一遍位置计算。
     // 分页退避重试只在这里驱动一次。放在占位项里会变成「每个可见占位项一条重试循环」。
-    ChapterAppendRetryEffect(pageItems)
+    ChapterAppendRetryEffect(pageItems, onReloadPages = onReloadPages)
 
     val position = controller.position
     val currentPage = position.forProgress
@@ -290,6 +294,7 @@ private fun ReaderReadyContent(
                     readerContext = readerContext,
                     gestureState = gestureState,
                     pageItems = pageItems,
+                    onReloadPages = onReloadPages,
                     toggleMenuVisibility = { dispatch(ToggleBarsVisibility) },
                     onHideMenu = {
                         if (overlayState.showSystemBars) {

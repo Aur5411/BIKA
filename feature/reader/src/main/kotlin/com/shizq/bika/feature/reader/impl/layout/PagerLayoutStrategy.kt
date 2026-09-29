@@ -41,6 +41,7 @@ class PagerLayoutStrategy(
         modifier: Modifier,
         onPageTap: (PageTapContext) -> Unit,
         onUserScroll: () -> Unit,
+        onReloadPages: () -> Unit,
     ) {
         val currentOnUserScroll by rememberUpdatedState(onUserScroll)
         val isUserDragging by pagerState.interactionSource.collectIsDraggedAsState()
@@ -88,7 +89,7 @@ class PagerLayoutStrategy(
             // pageCount 更新与重组之间存在一帧的窗口，越界时退出而不是崩溃。
             val spread = spreads.getOrNull(spreadIndex)
             if (spread != null) {
-                SpreadContent(pageItems, spread, onPageTap, viewport)
+                SpreadContent(pageItems, spread, onPageTap, viewport, onReloadPages)
             }
         }
 
@@ -144,13 +145,14 @@ class PagerLayoutStrategy(
         spread: PageSpread,
         onPageTap: (PageTapContext) -> Unit,
         viewport: ViewportAnchor,
+        onReloadPages: () -> Unit,
     ) {
         when (spread) {
             is PageSpread.Single -> Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) {
-                SinglePage(pages, spread.startIndex, onPageTap, viewport)
+                SinglePage(pages, spread.startIndex, onPageTap, viewport, onReloadPages)
             }
 
             is PageSpread.Double -> Row(
@@ -160,10 +162,10 @@ class PagerLayoutStrategy(
                 // RTL 下 LocalLayoutDirection 已经翻转了 Row 的排列方向，
                 // 这里按阅读顺序放入即可，不需要手动交换左右。
                 Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    SinglePage(pages, spread.startIndex, onPageTap, viewport)
+                    SinglePage(pages, spread.startIndex, onPageTap, viewport, onReloadPages)
                 }
                 Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    SinglePage(pages, spread.secondIndex, onPageTap, viewport)
+                    SinglePage(pages, spread.secondIndex, onPageTap, viewport, onReloadPages)
                 }
             }
         }
@@ -175,10 +177,11 @@ class PagerLayoutStrategy(
         index: Int,
         onPageTap: (PageTapContext) -> Unit,
         viewport: ViewportAnchor,
+        onReloadPages: () -> Unit,
     ) {
         val page = if (index < pages.itemCount) pages[index] else null
         if (page == null) {
-            ChapterPageLoadStateItem(pages, index)
+            ChapterPageLoadStateItem(pages, index, onReloadPages = onReloadPages)
             return
         }
         ComicPageItem(

@@ -48,6 +48,7 @@ class WebtoonLayoutStrategy(
         modifier: Modifier,
         onPageTap: (PageTapContext) -> Unit,
         onUserScroll: () -> Unit,
+        onReloadPages: () -> Unit,
     ) {
         val currentOnUserScroll by rememberUpdatedState(onUserScroll)
         val isUserDragging by listState.interactionSource.collectIsDraggedAsState()
@@ -89,7 +90,7 @@ class WebtoonLayoutStrategy(
                 pageItems[index]?.let {
                     // 缩放与点击都由容器处理，这里不传 onTap
                     ComicPageItem(it, index, magnifierEnabled = magnifierEnabled)
-                } ?: ChapterPageLoadStateItem(pageItems, index)
+                } ?: ChapterPageLoadStateItem(pageItems, index, onReloadPages = onReloadPages)
             }
         }
     }

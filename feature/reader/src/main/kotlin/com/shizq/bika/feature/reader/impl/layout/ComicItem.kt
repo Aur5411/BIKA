@@ -80,7 +80,10 @@ private val pagingLogger = KotlinLogging.logger("ReaderPaging")
  * 失败原因日志也只在这里记一次，不再按可见占位项数量刷屏。
  */
 @Composable
-fun ChapterAppendRetryEffect(pageItems: LazyPagingItems<ChapterPage>) {
+fun ChapterAppendRetryEffect(
+    pageItems: LazyPagingItems<ChapterPage>,
+    onReloadPages: () -> Unit = {},
+) {
     // 退避计数活在协程栈上，不是组合状态。
     //
     // 之前是 `remember` 计数 + `LaunchedEffect(error, autoRetryCount)`，即 effect
@@ -91,6 +94,7 @@ fun ChapterAppendRetryEffect(pageItems: LazyPagingItems<ChapterPage>) {
     //
     // 循环自驱动：每轮主动读一次 loadState，不依赖「新的 LoadState.Error 与旧的
     // 不相等」来推进。每轮必经一次 delay，不会退化成忙循环。
+    val currentOnReload by rememberUpdatedState(onReloadPages)
     LaunchedEffect(pageItems) {
         var attempt = 0
         var logged = false
@@ -105,18 +109,15 @@ fun ChapterAppendRetryEffect(pageItems: LazyPagingItems<ChapterPage>) {
 
             if (!logged) {
                 logged = true
-//                if (throwable.isRetryableError()) {
-//                    pagingLogger.error(throwable) { "章节分页加载失败" }
-//                } else {
-//                    // 404 等永久失败：提示后不再自动重试
-//                    pagingLogger.warn(throwable) { "章节分页永久不可用(不重试)" }
-//                }
             }
-            // 永久失败：结束协程。用户点击占位项仍可手动 retry()。
-//            if (!throwable.isRetryableError()) return@LaunchedEffect
 
             delay(backoffDelayMillis(attempt))
             attempt++
+            // 两件事必须一起做：`retry()` 修 Paging 内部的数据副本，
+            // [currentOnReload] 让 composition 收到重建后的分页流。
+            // 只做前者时重试在表面上看不出任何变化（见 ReaderViewModel 的说明），
+            // 这正是"重试也没有用"的来源之一。
+            currentOnReload()
             pageItems.retry()
         }
     }
@@ -134,6 +135,7 @@ fun ChapterPageLoadStateItem(
     pageItems: LazyPagingItems<ChapterPage>,
     index: Int,
     modifier: Modifier = Modifier,
+    onReloadPages: () -> Unit = {},
 ) {
     val loadState = pageItems.loadState
     val isError = loadState.refresh is LoadState.Error || loadState.append is LoadState.Error
@@ -145,7 +147,12 @@ fun ChapterPageLoadStateItem(
     // 点击不出菜单、也不翻页，而 Pager 模式下点击是主要的翻页方式。
     // 同样的坑在 core/ui 的 RetryableAsyncImage 里已有注释记录。
     val errorClickable = if (isError) {
-        Modifier.clickable { pageItems.retry() }
+        Modifier.clickable {
+            // 与 ChapterAppendRetryEffect 同一套动作：重载分页流 + 让 Paging 重拉。
+            // 少了前者，点击重试在界面上不会有任何变化。
+            onReloadPages()
+            pageItems.retry()
+        }
     } else {
         Modifier
     }

@@ -41,12 +41,37 @@ internal class ReaderPreloadSession<T : Any>(
     private var latestGeneration = 0L
     private var highestSubmittedGeneration = 0L
 
+    /**
+     * 预载饿死时用来推动续拉的回调。
+     *
+     * 预载窗口越过了 Paging 已加载范围末尾时，窗口内的页全部取不到数据，
+     * 队列空转（见 [PreloadQueue.starvationCount]）。这在章节约 40 张图一个
+     * API 页的边界上必然发生，而用户"翻到那里却发现图还没开始下"的体验就来自它。
+     *
+     * 这里在每次视口处理完后检查一次：如果饿死计数比上次见到的大，就催一次续拉。
+     * 用计数而非固定间隔判断，既能及时响应边界，又不会在正常滚动时反复触发。
+     */
+    var onStarvation: (() -> Unit)? = null
+
+    private var lastSeenStarvation = 0
+
     private val worker: Job = scope.launch {
         for (event in events) {
             when (event) {
-                is Event.ViewportChanged -> handle(event)
+                is Event.ViewportChanged -> {
+                    handle(event)
+                    notifyStarvationIfNeeded()
+                }
                 Event.Close -> break
             }
+        }
+    }
+
+    private fun notifyStarvationIfNeeded() {
+        val current = enqueuer.starvationCount
+        if (current > lastSeenStarvation) {
+            lastSeenStarvation = current
+            onStarvation?.invoke()
         }
     }
 

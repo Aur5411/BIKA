@@ -9,9 +9,83 @@ import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlin.random.Random
 
 private val logger = KotlinLogging.logger("ChapterPagesPagingSource")
+
+/**
+ * 章节图片分页在 [load] 内部的即时重试次数。
+ *
+ * append 失败会让 Paging 停止续拉：[ChapterAppendRetryEffect] 虽会退避重试，但一旦
+ * 用户此刻正停在那个边界上（章节约第 20 页之后就是最常见的落点），他看到的就是
+ * 一整屏"加载失败"，要等好几秒才可能自愈。而这一类失败绝大多数只是一次网络抖动，
+ * 在数据层原地重试几乎立刻就能过，用户完全感知不到。
+ *
+ * 取 3：抖动是瞬时的，两次重试足够覆盖；再多只是把真正的故障拖长。
+ */
+private const val PAGE_LOAD_MAX_ATTEMPTS = 3
+
+private const val PAGE_LOAD_RETRY_BASE_DELAY_MS = 350L
+private const val PAGE_LOAD_RETRY_JITTER_MS = 250L
+
+/**
+ * 是否值得在 [load] 内部原地重试。
+ *
+ * 4xx（除 429）是语义明确的永久失败（参数不对、无权限、资源不存在），重试只是
+ * 浪费请求；429、5xx，以及超时/连接被重置/DNS 失败这类传输层异常都是一次性的，
+ * 值得重试。
+ */
+private fun Throwable?.isRetryablePageLoad(): Boolean {
+    if (this == null) return true
+    if (this is CancellationException) return false
+    val message = message.orEmpty()
+    // 从异常文本里提取 HTTP 状态码：本模块不依赖图片链路，拿不到带响应的异常类型，
+    // 而 Ktor 与 OkHttp 抛出的异常文本里都带得状态码。
+    val code = HTTP_STATUS_PATTERN.find(message)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    if (code != null) return code == 429 || code >= 500
+    return true
+}
+
+private val HTTP_STATUS_PATTERN = Regex("""\b([1-5]\d\d)\b""")
+
+/**
+ * 带原地重试的取数。抽成独立函数是为了让它可单测——[ChapterPagesPagingSource]
+ * 依赖 final 的 [BikaDataSource]，在单测里没法替换。
+ *
+ * @param fetch 真正的那一次网络请求
+ * @param onRetry 每次**确实还会再试一次**时回调，参数是刚刚失败的是第几次尝试。
+ *   用尽次数后的最后一次失败不再回调——那时没有"重试"，只有终止。
+ * @param sleep 重试前的等待，注入以便测试用虚拟时间跳过
+ */
+internal suspend fun <T> fetchWithPageRetry(
+    maxAttempts: Int = PAGE_LOAD_MAX_ATTEMPTS,
+    fetch: suspend () -> T,
+    onRetry: (attempt: Int, error: Throwable) -> Unit = { _, _ -> },
+    sleep: suspend (millis: Long) -> Unit = { delay(it) },
+): T {
+    var lastError: Throwable? = null
+    for (attempt in 0 until maxAttempts) {
+        try {
+            return fetch()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            lastError = e
+            if (!e.isRetryablePageLoad()) throw e
+            val remaining = maxAttempts - attempt - 1
+            if (remaining > 0) {
+                onRetry(attempt + 1, e)
+                sleep(
+                    PAGE_LOAD_RETRY_BASE_DELAY_MS * (attempt + 1) +
+                            Random.nextLong(PAGE_LOAD_RETRY_JITTER_MS)
+                )
+            }
+        }
+    }
+    throw lastError ?: IllegalStateException("请求失败")
+}
 
 class ChapterPagesPagingSource @AssistedInject constructor(
     @Assisted private val id: String,
@@ -36,6 +110,32 @@ class ChapterPagesPagingSource @AssistedInject constructor(
         // append/prepend 沿用 Paging 传入的 key，不受它影响。
         val requestedApiPage = params.key ?: initialApiPage
 
+        // 数据层原地重试：失败一次就交给 UI 会让"正停在分页边界上的那一屏"永久停在
+        // 错误态（见 PAGE_LOAD_MAX_ATTEMPTS 的说明）。重试逻辑见 fetchWithPageRetry。
+        return try {
+            fetchWithPageRetry(
+                fetch = { loadOnce(requestedApiPage) },
+                onRetry = { attempt, error ->
+                    logger.warn(error) {
+                        "章节分页第 $attempt/$PAGE_LOAD_MAX_ATTEMPTS 次失败，" +
+                                "comic=$id order=$order 请求页=$requestedApiPage"
+                    }
+                },
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error(e) {
+                "章节分页重试 $PAGE_LOAD_MAX_ATTEMPTS 次仍失败: comic=$id order=$order " +
+                        "请求页=$requestedApiPage"
+            }
+            LoadResult.Error(e)
+        }
+    }
+
+    private suspend fun loadOnce(
+        requestedApiPage: Int,
+    ): LoadResult<Int, ChapterPage> {
         return try {
             val response = dataSource.getChapterPages(id, order, requestedApiPage)
             val imagePages = response.imagePages
@@ -51,9 +151,14 @@ class ChapterPagesPagingSource @AssistedInject constructor(
                 }
             }
 
-            // 中间出现空页但按 total 计算后面还应该有数据：数据源自相矛盾，
-            // 不生成用户能看见但无法通过下拉重试的空洞，直接报错走现有重试 UI。
+            // 中间出现空页但按 total 计算后面还应该有数据：数据源自相矛盾。
+            //
+            // 这不是网络抖动，重试同一页只会拿到同样的空响应，因此在 loadOnce 里
+            // 直接以返回值的形态交出去（不抛异常 → 不被外层重试循环吞掉）。
             if (docsSize == 0 && limit > 0 && total > respPage * limit) {
+                logger.error {
+                    "章节分页返回空页但 total 显示后面仍有数据: page=$respPage total=$total limit=$limit"
+                }
                 return LoadResult.Error(
                     IllegalStateException(
                         "章节分页返回空页但 total 显示后面仍有数据: page=$respPage total=$total limit=$limit"
@@ -84,8 +189,8 @@ class ChapterPagesPagingSource @AssistedInject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.error(e) { "章节分页加载失败: comic=$id order=$order 请求页=$requestedApiPage" }
-            LoadResult.Error(e)
+            // 不再在这里吞掉异常：交给调用方决定是否原地重试。
+            throw e
         }
     }
 

@@ -32,11 +32,32 @@ internal class PreloadQueue<K : Any, T : Any>(
     private val failedInWindow = mutableSetOf<K>()
     private var closed = false
 
+    /**
+     * 预载窗口里原本有任务、本次 [update] 后却一个都没有的次数。
+     *
+     * 这不是失败，而是一个**结构性问题**：预载窗口的每一条都取不到数据
+     * （典型情形是 Paging 的 itemCount 还没长到窗口覆盖的范围）。此时队列会
+     * 一直空着，直到下一次视口事件或数据刷新才重新尝试；用户在这一段时间里
+     * 已经翻到了那些页，但没人去准备它们。
+     *
+     * 真实场景就发生在分页边界：章节每 40 张图一个 API 页，预载窗口一旦越过
+     * 已加载范围末尾（约第 20 页之后是最常见的落点），`getItem` 全部返回 null，
+     * 窗口直接饿死。
+     */
+    @Volatile
+    var starvationCount: Int = 0
+        private set
+
     fun update(items: List<T>, retainRunning: Set<K> = emptySet()) {
         if (closed) return
+        val previousSize = wanted.size
         wanted = items.associateByTo(linkedMapOf(), keyOf)
         completed.retainAll(wanted.keys)
         failedInWindow.retainAll(wanted.keys)
+
+        if (wanted.isEmpty() && previousSize > 0) {
+            starvationCount++
+        }
 
         // A prefetched page that has just become visible should finish its download.
         // Its foreground request can then read the same disk entry without restarting.

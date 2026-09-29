@@ -34,6 +34,13 @@ interface ReaderLayoutStrategy {
         modifier: Modifier,
         onPageTap: (PageTapContext) -> Unit,
         onUserScroll: () -> Unit,
+        /**
+         * 分页数据失败后重建分页流的回调（见 ReaderViewModel.reloadChapterPages）。
+         *
+         * 必须从宿主一路传到占位项：只让 Paging 自己 `retry()` 时，UI 收到的仍是
+         * 失败前那份缓存快照，表现为"点了重试什么也没发生"。
+         */
+        onReloadPages: () -> Unit = {},
     )
 }
 
@@ -49,6 +56,7 @@ fun ReaderLayoutHost(
     pageItems: LazyPagingItems<ChapterPage>,
     toggleMenuVisibility: () -> Unit,
     onHideMenu: () -> Unit,
+    onReloadPages: () -> Unit = {},
 ) {
     val currentGestureState by rememberUpdatedState(gestureState)
     val currentOnHideMenu by rememberUpdatedState(onHideMenu)
@@ -106,5 +114,6 @@ fun ReaderLayoutHost(
         modifier = Modifier.fillMaxSize(),
         onPageTap = onPageTap,
         onUserScroll = currentOnHideMenu,
+        onReloadPages = onReloadPages,
     )
 }

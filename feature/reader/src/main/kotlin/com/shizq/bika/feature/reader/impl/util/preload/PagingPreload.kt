@@ -7,6 +7,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.platform.LocalContext
 import androidx.paging.ItemSnapshotList
+import androidx.paging.LoadState
 import androidx.paging.compose.LazyPagingItems
 import kotlinx.coroutines.flow.combine
 
@@ -32,6 +33,21 @@ fun <T : Any> PagingPreload(
             enqueuer = enqueuer,
             closeEnqueuer = enqueuer::close,
         )
+        // 预载窗口越过 Paging 已加载范围末尾时，主动催一次续拉。
+        //
+        // 这是一个"用户明明还没滑到、我们却应该提前拉"的缺口：预载窗口的页如果
+        // 还不在 Paging 的 itemCount 里，预载器一条请求都发不出来（取不到 item），
+        // 只能干等。用户滑到那里时才是第一次请求——那正是"翻过 20 页之后开始
+        // 一张一张等"的来源。这里在检测到窗口落空时把续拉推起来，让预载重新
+        // 有东西可下。
+        //
+        // 分页边界（章节约 40 张图一个 API 页）是它最主要的触发点。
+        session.onStarvation = {
+            // 已经在加载中就不要重复催：Paging 的 append 是串行的，重复调用没有增益。
+            if (pagingItems.loadState.append !is LoadState.Loading) {
+                pagingItems.retry()
+            }
+        }
         try {
             val viewportEvents = scrollStateProvider.viewportEvents
             var previousSnapshot: ItemSnapshotList<T>? = null

@@ -328,6 +328,8 @@ class ReaderPreloadSessionTest {
         val windows = mutableListOf<List<PreloadRequest>>()
         val visibleWindows = mutableListOf<List<PreloadRequest>>()
 
+        override val starvationCount: Int = 0
+
         override fun updateWindow(
             requests: List<PreloadRequest>,
             visibleRequests: List<PreloadRequest>,
