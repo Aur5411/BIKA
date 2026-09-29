@@ -57,12 +57,11 @@ sealed interface PageLoadResult {
  *    （append 非 Loading）、而 index 仍在 itemCount 之外 → [PageLoadResult.OutOfBounds]
  * 3. 其余情况发 null，继续等
  *
- * 第 2 条为什么可以立刻判定：本项目 enablePlaceholders = true 且分页源上报了
- * itemsBefore/itemsAfter，首屏一到 itemCount 就等于服务端 total，所以
+ * 第 2 条为什么可以立刻判定：ChapterPagesPagingSource 现在一次性拉取整章、
+ * 作为**单页全量**返回，首屏一到 itemCount 就等于真实图片总数，所以
  * 「index >= itemCount」在首次加载完成后就是可信的越界判据。
- * 要求 append 处于 NotLoading 是为了兼容 computePlaceholderCounts 退化成
- * COUNT_UNDEFINED 的路径——那条路径下 itemCount 会随 append 增长，
- * 必须等它不再增长时才做判断。
+ * 要求 append 处于 NotLoading 是历史遗留的保守检查：全量单页下 append 恒为
+ * NotLoading（不存在后续页），保留它不改变行为，只是让判据在两种形态下都成立。
  *
  * peek 与 loadState 都是 Compose 快照状态，数据到达会触发重新求值，无需轮询。
  */

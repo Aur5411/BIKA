@@ -35,13 +35,14 @@ fun <T : Any> PagingPreload(
         )
         // 预载窗口越过 Paging 已加载范围末尾时，主动催一次续拉。
         //
-        // 这是一个"用户明明还没滑到、我们却应该提前拉"的缺口：预载窗口的页如果
-        // 还不在 Paging 的 itemCount 里，预载器一条请求都发不出来（取不到 item），
-        // 只能干等。用户滑到那里时才是第一次请求——那正是"翻过 20 页之后开始
-        // 一张一张等"的来源。这里在检测到窗口落空时把续拉推起来，让预载重新
-        // 有东西可下。
+        // 历史背景：旧实现按 API 页 append 续拉，预载窗口一旦越过已加载末尾，
+        // 窗口内的页全部取不到 item，预载器只能干等；用户滑过去才是第一次请求，
+        // 表现为"翻过几十页后开始一张一张等"。
         //
-        // 分页边界（章节约 40 张图一个 API 页）是它最主要的触发点。
+        // 现状：ChapterPagesPagingSource 已改为**一次性拉取整章**并作为单页全量
+        // 返回，不存在"后续页还没加载"的状态，这个回调自然不再触发（append 恒为
+        // NotLoading，且 starvationCount 不会增长）。保留它是为了不破坏
+        // ReaderPreloadSession 的接口契约，也作为将来若改回增量加载的兜底。
         session.onStarvation = {
             // 已经在加载中就不要重复催：Paging 的 append 是串行的，重复调用没有增益。
             if (pagingItems.loadState.append !is LoadState.Loading) {

@@ -67,6 +67,21 @@ import me.saket.telephoto.zoomable.zoomable
 
 private val pagingLogger = KotlinLogging.logger("ReaderPaging")
 
+private val logger = KotlinLogging.logger("ReaderImage")
+
+/**
+ * 单张页图的自动重试次数。
+ *
+ * 图片层的 [com.shizq.bika.core.network.image.ImageThrottleInterceptor] 已经在
+ * 传输层重试过 3 次并做过退避；这里再补一层"UI 侧重启"，覆盖它放弃后仍属于
+ * 暂时性的情形（例如它因单张等待超限而主动放弃、结果下一轮立刻就能成功）。
+ * 取 2：再多只会让真正失效的图长时间占着组合节点空转。
+ */
+private const val IMAGE_AUTO_RETRY_MAX = 2
+
+/** 单张页图自动重试的基准间隔，按次数线性放大。 */
+private const val IMAGE_AUTO_RETRY_BASE_MS = 800L
+
 /**
  * 章节分页失败后的**唯一**退避重试驱动（间隔 2s/4s/8s/16s/30s 封顶）。
  *
@@ -315,14 +330,47 @@ fun ComicPageItem(
 
     val state by painter.state.collectAsState()
 
-    // 手动重试信号：递增即重启退避协程，重试计数归零，用户的显式操作立即生效
-    // 而不用等当前退避走完。计数本身活在协程栈上，不是组合状态——理由见
-    // [autoRetryOnError]，那里也解释了为什么这个形状不能退回「计数当 key」。
+    // 手动重试信号：递增会重启下面的重试协程，attempt 归零，用户的显式操作
+    // 立即生效而不用等当前退避走完。
     var manualRetryNonce by remember(page.id) { mutableIntStateOf(0) }
+
+    // 自动重试 + 手动重试二合一。
+    //
+    // 背景：Coil 自身没有重试机制，一次 ErrorResult 就是这个请求的结局。此前这里
+    // 的自动重试调用被注释、函数实现也已不存在，于是单张页图失败后就**只剩**用户
+    // 点击一条路；而用户点了 painter.restart() 时若正处在限流冷却期内，
+    // ImageThrottleInterceptor 会把这次请求 delay 最多 25s 才判失败——用户看到
+    // 的就是"点了没反应、重试也没用"。
+    //
+    // 现在：失败后在本协程里按退避自动重试若干次；用户点击（manualRetryNonce 自增）
+    // 会让本协程重启，计数归零、立即重试一次，不必等退避走完。
     // key 用 imageRequest 而非 painter：painter 实例在 model 变化时会被复用，
     // 只按它做 key 会让复用到新页的节点继承上一页的退避计数与已记日志标记。
     LaunchedEffect(imageRequest, manualRetryNonce) {
-//        painter.autoRetryOnError { "第 ${index + 1} 页 url=${page.url}" }
+        var attempt = 0
+        while (true) {
+            val current = painter.state.value
+            if (current is AsyncImagePainter.State.Error) {
+                if (attempt >= IMAGE_AUTO_RETRY_MAX) {
+                    logger.debug { "第 ${index + 1} 页自动重试已用尽: url=${page.url}" }
+                    break
+                }
+                attempt++
+                val delayMs = IMAGE_AUTO_RETRY_BASE_MS * attempt
+                logger.debug { "第 ${index + 1} 页加载失败，${delayMs}ms 后第 $attempt 次自动重试" }
+                delay(delayMs)
+                painter.restart()
+            } else {
+                // 等下一次状态变化：成功/加载中都不需要动作。
+                // snapshotFlow 而非 collect：只在状态"变到 Error"时才唤醒重试循环，
+                // 避免 Loading→Error→Loading 的抖动让重试计数虚增。
+                snapshotFlow { painter.state.value }
+                    .first { it is AsyncImagePainter.State.Error || it is AsyncImagePainter.State.Success }
+                if (painter.state.value is AsyncImagePainter.State.Success) {
+                    break
+                }
+            }
+        }
     }
 
     Box(
