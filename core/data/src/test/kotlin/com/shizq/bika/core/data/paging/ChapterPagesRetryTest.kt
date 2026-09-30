@@ -51,7 +51,11 @@ class ChapterPagesRetryTest {
                 sleep = noSleep,
             )
         }
-        assertEquals(3, calls, "重试有上限，不应无限重试")
+        assertEquals(
+            PAGE_LOAD_MAX_ATTEMPTS,
+            calls,
+            "重试有上限，不应无限重试",
+        )
     }
 
     @Test
@@ -83,7 +87,11 @@ class ChapterPagesRetryTest {
                 sleep = noSleep,
             )
         }
-        assertEquals(3, calls, "429 是暂时性失败，值得重试")
+        assertEquals(
+            PAGE_LOAD_MAX_ATTEMPTS,
+            calls,
+            "429 是暂时性失败，值得重试",
+        )
     }
 
     @Test
@@ -114,7 +122,7 @@ class ChapterPagesRetryTest {
             )
         }
 
-        // 三次尝试、前两次失败各回调一次，参数是"第几次尝试失败了"。
-        assertEquals(listOf(1, 2), failedAttempts)
+        // 第 1 次失败回调，第 2 次失败回调，……，最后一次失败后没有重试所以不回调。
+        assertEquals((1 until PAGE_LOAD_MAX_ATTEMPTS).toList(), failedAttempts)
     }
 }

@@ -60,6 +60,7 @@ import com.shizq.bika.core.ui.backoffDelayMillis
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlin.random.Random
 import me.saket.telephoto.zoomable.EnabledZoomGestures
 import me.saket.telephoto.zoomable.ZoomSpec
 import me.saket.telephoto.zoomable.rememberZoomableState
@@ -72,15 +73,21 @@ private val logger = KotlinLogging.logger("ReaderImage")
 /**
  * 单张页图的自动重试次数。
  *
- * 图片层的 [com.shizq.bika.core.network.image.ImageThrottleInterceptor] 已经在
- * 传输层重试过 3 次并做过退避；这里再补一层"UI 侧重启"，覆盖它放弃后仍属于
- * 暂时性的情形（例如它因单张等待超限而主动放弃、结果下一轮立刻就能成功）。
- * 取 2：再多只会让真正失效的图长时间占着组合节点空转。
+ * 传输层（[com.shizq.bika.core.network.image.ImageThrottleInterceptor]）已在
+ * 自己内部重试至多 5 次、累计等待 45s；这里再补一层"UI 侧重启"，覆盖两层情形：
+ * - 它因预载预算（8s）主动放弃、结果下一轮立刻就能成功；
+ * - 它因取消（用户滑走又滑回）中止，而这张图其实只是缺一次干净的重新请求。
+ *
+ * 取 5：配合下面的间隔，总覆盖窗口约 800+1600+2400+3200+4000 ≈ 12s，
+ * 与限流冷却上限（12s）对齐——一次完整的冷却刚好能被这一串自动重试穿越。
  */
-private const val IMAGE_AUTO_RETRY_MAX = 2
+private const val IMAGE_AUTO_RETRY_MAX = 5
 
 /** 单张页图自动重试的基准间隔，按次数线性放大。 */
 private const val IMAGE_AUTO_RETRY_BASE_MS = 800L
+
+/** 自动重试间隔的随机抖动上限：同屏多张图同时失败时错开重启时刻，别一起撞同一堵墙。 */
+private const val IMAGE_AUTO_RETRY_JITTER_MS = 400L
 
 /**
  * 章节分页失败后的**唯一**退避重试驱动（间隔 2s/4s/8s/16s/30s 封顶）。
@@ -338,12 +345,14 @@ fun ComicPageItem(
     //
     // 背景：Coil 自身没有重试机制，一次 ErrorResult 就是这个请求的结局。此前这里
     // 的自动重试调用被注释、函数实现也已不存在，于是单张页图失败后就**只剩**用户
-    // 点击一条路；而用户点了 painter.restart() 时若正处在限流冷却期内，
-    // ImageThrottleInterceptor 会把这次请求 delay 最多 25s 才判失败——用户看到
-    // 的就是"点了没反应、重试也没用"。
+    // 点击一条路；而用户点 painter.restart() 时若正处在限流冷却期内，
+    // ImageThrottleInterceptor 会把这次请求 delay 才判失败——用户看到的就是
+    // "点了没反应、重试也没用"。
     //
-    // 现在：失败后在本协程里按退避自动重试若干次；用户点击（manualRetryNonce 自增）
-    // 会让本协程重启，计数归零、立即重试一次，不必等退避走完。
+    // 现在已经双管齐下：
+    // - 传输层：冷却上限压到 12s，且可见页 acquire() 恒排队不放弃，保证重试**必然等到**；
+    // - UI 层：失败后在协程里按退避自动重试，用户点击立即重启计数归零、马上再试一次。
+    //
     // key 用 imageRequest 而非 painter：painter 实例在 model 变化时会被复用，
     // 只按它做 key 会让复用到新页的节点继承上一页的退避计数与已记日志标记。
     LaunchedEffect(imageRequest, manualRetryNonce) {
@@ -356,9 +365,11 @@ fun ComicPageItem(
                     break
                 }
                 attempt++
-                val delayMs = IMAGE_AUTO_RETRY_BASE_MS * attempt
+                val delayMs = IMAGE_AUTO_RETRY_BASE_MS * attempt +
+                        Random.nextLong(IMAGE_AUTO_RETRY_JITTER_MS)
                 logger.debug { "第 ${index + 1} 页加载失败，${delayMs}ms 后第 $attempt 次自动重试" }
                 delay(delayMs)
+                if (painter.state.value is AsyncImagePainter.State.Success) break
                 painter.restart()
             } else {
                 // 等下一次状态变化：成功/加载中都不需要动作。

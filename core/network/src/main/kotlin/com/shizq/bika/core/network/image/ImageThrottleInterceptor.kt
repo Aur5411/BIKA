@@ -57,8 +57,9 @@ internal class ImageThrottleInterceptor(
         var attempt = 0
         var waitedTotalMs = 0L
         while (true) {
+            // acquire() 对可见页恒返回 true（排队死等），对预载在长冷却期才会返回 false。
             if (!governor.acquire(isPrefetch)) {
-                logger.debug { "限流中，放弃本次预载: $data" }
+                logger.debug { "限流中，放弃本轮预载: $data" }
                 return ErrorResult(null, chain.request, IOException("skipped while throttled"))
             }
 
@@ -95,9 +96,11 @@ internal class ImageThrottleInterceptor(
             }
             // 抖动：同屏十几张图同时失败时，不加抖动会整齐地再撞一次同一堵墙。
             val pauseMs = waitMs + Random.nextLong(JITTER_MIN_MS, JITTER_MAX_MS)
-            // 单张图的总等待有上限：宁可让这一张先报失败、用户滑走再滑回来时重来，
-            // 也不要让用户对着同一个加载圈干等半分钟以上。
-            if (waitedTotalMs + pauseMs > MAX_WAIT_TOTAL_MS) {
+            // 可见页的总等待上限显著放宽：用户的诉求是"不要有加载失败的图"，
+            // 宁可这一张多等几秒最终成功，也不要弹出一个"点击重试"。
+            // 预载仍维持较短上限——它不在关键路径上，堵着不如让路。
+            val budgetMs = if (isPrefetch) PREFETCH_MAX_WAIT_TOTAL_MS else MAX_WAIT_TOTAL_MS
+            if (waitedTotalMs + pauseMs > budgetMs) {
                 logger.warn { "等待累计 ${waitedTotalMs}ms 仍未能取到图，本张先放弃: $data" }
                 return result
             }
@@ -120,10 +123,16 @@ internal class ImageThrottleInterceptor(
     }
 
     private companion object {
-        const val MAX_ATTEMPTS = 3
+        /** 可见页重试次数。提到 5：3 次在遇到 429 时往往只覆盖到一个冷却窗口，不够穿越。 */
+        const val MAX_ATTEMPTS = 5
         const val RETRY_BACKOFF_MS = 400L
-        /** 一张图愿意等待的上限；超过就先交还给 UI，滑走再滑回来即是一轮新的重试。 */
-        const val MAX_WAIT_TOTAL_MS = 25_000L
+
+        /** 可见页一张图愿意等待的上限；目标是不让用户看到失败态。 */
+        const val MAX_WAIT_TOTAL_MS = 45_000L
+
+        /** 预载的等待上限：它不在关键路径上，别为了它长时间占住名额。 */
+        const val PREFETCH_MAX_WAIT_TOTAL_MS = 8_000L
+
         const val JITTER_MIN_MS = 60L
         const val JITTER_MAX_MS = 400L
         const val HTTP_TOO_MANY_REQUESTS = 429

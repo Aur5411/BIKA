@@ -56,17 +56,19 @@ data class PreloadRequest(
  * 预载并发数。
  *
  * 与图片客户端对同一域名的并发上限（见 NetworkModule 的
- * `IMAGE_MAX_REQUESTS_PER_HOST`）留出余量：预载、当前可见页、进度条预览图
- * 共用那一个额度，预载只该占其中一部分，否则会把"用户正在看的那一张"挤到后面。
+ * `IMAGE_MAX_REQUESTS_PER_HOST`，现为 64）留出充足余量：预载、当前可见页、
+ * 进度条预览图共用那一份额度，预载只该占其中一部分，否则会把"用户正在看的那一张"
+ * 挤到后面。
  *
- * 取 12：扫读时预载窗口是 16 页（见 AdaptivePreloadPolicy），并发低于窗口宽度
- * 时窗口根本喂不满——排在窗口末尾的页要等前面的下完才开始，翻到那里就露加载态。
- * 12 与窗口同量级，同时给可见页、进度条预览留下大部分额度（同域名上限 32）。
+ * 取 16：快速扫读时预载窗口是 16 页（见 AdaptivePreloadPolicy），并发**等于**窗口宽度
+ * 才能把整个窗口一次喂满——排在窗口末尾的页不必等前面的下完才开始，翻到那里就是命中缓存。
+ * 并发小于窗口宽度是"窗口调大了、并发没跟上"的残留，表现为"翻得越快越容易露加载态"。
  *
- * 原先是 2——且因为 [PreloadQueue] 当时给了默认值、这里没传参，那个 2 是隐形的；
- * 后来提到 5，仍小于窗口宽度 10，是"窗口调大了但没跟着调并发"的残留。
+ * 16 同时给可见页与进度条预览留下大部分额度（同域名 64、全局在飞 48）。
+ *
+ * 原先是 2——且因为 [PreloadQueue] 当时给了默认值、这里没传参，那个 2 是隐形的。
  */
-private const val PRELOAD_CONCURRENCY = 12
+private const val PRELOAD_CONCURRENCY = 16
 
 internal class CoilPreloadRequestEnqueuer(
     context: Context,

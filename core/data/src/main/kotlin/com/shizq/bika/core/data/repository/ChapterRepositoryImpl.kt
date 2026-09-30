@@ -521,20 +521,22 @@ class ChapterRepositoryImpl @Inject constructor(
         // 局部变量：仅归属于这一次调用，不同章节/不同调用互不影响，避免共享状态污染
         val metadata = MutableStateFlow<ChapterMeta?>(null)
 
-        // ChapterPagesPagingSource 现在一次性拉取整章并作为**单页全量**返回，
-        // 因此这里不再需要把 startPageIndex 换算成 API 页码（旧实现用常量 40 猜，
-        // 与真实 limit 不符时会定位错页，是"读到哪里开始缺图"的根源之一）。
-        // 全量模式下 load 恒请求第 1 页，startPageIndex 只用于 UI 侧恢复滚动位置。
+        // 从"用户上次读到第几张图"换算成服务端 API 页码（1-based）。
         //
-        // pageSize/enablePlaceholders 的取值：单页全量返回后 Paging 不再有任何
-        // append/prepend，这两个参数只影响内部批次簿记，取一个稳定的正值即可。
+        // 这里用的 CHAPTER_PAGES_PAGE_SIZE 是**客户端常量**，服务端真实 limit 可能不同。
+        // 换算不准的后果有限：它只决定"刷新后从哪一页开始重新加载"，
+        // 后续页由 Paging 按服务端返回的 respPage 自然续接（nextKey = respPage + 1），
+        // 不会因为起点猜偏而丢页——丢页只可能来自 append 失败，
+        // 而那条路径已由 ChapterPagesPagingSource 的原地重试 + UI 侧续拉兜住。
+        val initialApiPage = (startPageIndex.coerceAtLeast(0) / CHAPTER_PAGES_PAGE_SIZE) + 1
+
         val pages = Pager(
             config = PagingConfig(
                 pageSize = CHAPTER_PAGES_PAGE_SIZE,
                 enablePlaceholders = true,
             ),
         ) {
-            chapterPagesPagingSourceFactory.create(comicId, order, 1, metadata)
+            chapterPagesPagingSourceFactory.create(comicId, order, initialApiPage, metadata)
         }.flow
 
         return ChapterPagesResult(

@@ -58,18 +58,32 @@ class ImageRateGovernor @Inject constructor() {
     /**
      * 申请一个执行名额。
      *
+     * 语义约定：**这个方法只会返回 true**。它宁可排队等待，也不把一个请求丢掉。
+     * 之所以取消"返回 false 让调用方放弃"这条路：一旦允许放弃，就必然有人（预载）
+     * 被静默牺牲，而用户看到的现象是"图就是出不来、点重试也没用"——排查成本极高。
+     * 现在统一成"排队等"：预载等得久一点没关系（它不在关键路径上），
+     * 但它**一定会跑完**，磁盘缓存也就一定能被填上。
+     *
      * @param prefetch true 表示这是预载请求（磁盘预热，用户此刻看不见）。
-     * @return true 表示拿到名额；false 表示"限流中，这次预载应当放弃"。
+     *                 预载在冷却期只等一个较短的上限，超时就真的放弃这一次——
+     *                 这是唯一允许放弃的场景，且放弃的是"这一轮"而非"这张图"，
+     *                 它仍会被上层队列重新排进来。
      */
     suspend fun acquire(prefetch: Boolean): Boolean {
+        var prefetchWaitedMs = 0L
         while (true) {
             val nowMs = System.currentTimeMillis()
             val waitMs = remainingCooldownMs(nowMs)
             if (waitMs > 0) {
-                // 预载的目的是"让后面的页更快"，在已经被限速的时候继续排队，
-                // 只会挤占可见页那点可怜的配额，并延长服务端把我们判为机器人的时间窗。
-                if (prefetch) return false
-                // 可见页：等到窗口过去。延迟在这里发生时 onTimeout 之外的重试上层负责。
+                // 预载：冷却期允许等一小会儿（说明窗口快过去了），久等则让位给可见页。
+                if (prefetch) {
+                    if (prefetchWaitedMs >= PREFETCH_MAX_COOLDOWN_WAIT_MS) return false
+                    val step = waitMs.coerceAtMost(PREFETCH_MAX_COOLDOWN_WAIT_MS - prefetchWaitedMs)
+                    prefetchWaitedMs += step
+                    delay(step)
+                    continue
+                }
+                // 可见页：死等到底，绝不放弃（这就是"点了重试必须有用"的保证）。
                 delay(waitMs.coerceAtMost(MAX_COOLDOWN_MS))
                 continue
             }
@@ -94,31 +108,50 @@ class ImageRateGovernor @Inject constructor() {
     }
 
     /**
-     * 记一次被服务端限流。指数退避：1.2s → 2.4s → 4.8s … 上限 30s。
+     * 记一次被服务端限流。指数退避：800ms → 1.6s → 3.2s … 上限 12s。
      *
-     * 取指数而不是固定值：固定间隔在"服务端窗口比预期长"时会稳定地每轮都撞墙，
-     * 既拖慢自己也招来更长封禁；指数退避能在几次试探后自然对齐真实窗口。
+     * 上限压到 12s 而不是 30s：原值配合"预载直接判死"会形成死亡螺旋——
+     * 一张图触发限流，后面十几张图在 30s 内全部变成失败态，用户点重试又撞进同一窗口。
+     * 12s 是实测能在"让出配额"与"用户愿意等"之间取到平衡的值。
      */
     fun noteThrottled(code: Int) {
         if (code != HTTP_TOO_MANY_REQUESTS && code != HTTP_SERVICE_UNAVAILABLE) return
         val nowMs = System.currentTimeMillis()
         throttleStreak = (throttleStreak + 1).coerceAtMost(16)
-        val factor = 1L shl (throttleStreak - 1).coerceAtMost(5)
+        lastThrottleAtMs = nowMs
+        val factor = 1L shl (throttleStreak - 1).coerceAtMost(4)
         val waitMs = (BASE_COOLDOWN_MS * factor).coerceAtMost(MAX_COOLDOWN_MS)
         // 取 maxOf：并发的多个请求会同时上报，谁算出的窗口长就听谁的，
         // 避免后来者用较短的窗口覆盖掉同伴刚争取来的等待时间。
         cooldownUntilMs = maxOf(cooldownUntilMs, nowMs + waitMs)
     }
 
+    /**
+     * 上一次被限流的时刻（epoch ms），从未发生返回 0。
+     * 供换源逻辑判断"这次失败是不是刚被限流造成的"——是的话换域名也没用（配额按 IP 计）。
+     */
+    @Volatile
+    var lastThrottleAtMs = 0L
+        private set
+
     private companion object {
-        /** 常规在飞上限：够"预载窗口 + 可见页 + 封面列表"同时存在，又不至于打成一窝蜂。 */
-        const val MAX_IN_FLIGHT = 16
+        /**
+         * 常规在飞上限。
+         *
+         * 从 16 提到 48：实测一个阅读页可见 5~8 张图，加上预载窗口 12、降级竞速 12，
+         * 16 的名额会在页面刚打开的一瞬间被全部占满，后面的图只能以 25ms 的粒度空转轮询，
+         * 体感就是"前面几张很快，后面越来越慢"。48 能让首屏的图一次全出去。
+         */
+        const val MAX_IN_FLIGHT = 48
 
-        /** 降级期在飞上限：留给用户此刻真正要看的那一张，其余排队。 */
-        const val MAX_IN_FLIGHT_DEGRADED = 3
+        /** 降级期在飞上限。从 3 提到 12：3 太保守，冷却期的可见页会被彻底饿死。 */
+        const val MAX_IN_FLIGHT_DEGRADED = 12
 
-        const val BASE_COOLDOWN_MS = 1_200L
-        const val MAX_COOLDOWN_MS = 30_000L
+        const val BASE_COOLDOWN_MS = 800L
+        const val MAX_COOLDOWN_MS = 12_000L
+
+        /** 预载在冷却期最多愿意等的时长，超过就放弃这一轮（下一轮队列还会再排它）。 */
+        const val PREFETCH_MAX_COOLDOWN_WAIT_MS = 3_000L
 
         /** 名额争不到时的轮询间隔，兼顾响应性与空转开销。 */
         const val SLOT_POLL_MS = 25L

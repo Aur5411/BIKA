@@ -79,15 +79,35 @@ class DirectDns @Inject constructor(
 
     private fun isApiHost(hostname: String): Boolean = hostname.matchesHost(BikaEndpoints.API_HOST)
 
+    /**
+     * 是不是图片域名。
+     *
+     * 判据是**「不是 API 域名，且用户配置了图片直连 IP」**，而不是"后缀在已知列表里"。
+     *
+     * 旧实现用后缀白名单（picacomic.com / diwodiwo.xyz / tipatipa.xyz），
+     * 于是服务端一旦启用新的存储节点（例如启用某个新 CDN 域名），那个域名的图
+     * 就会**回落到系统 DNS**：在 DNS 被污染或不可达的网络里直接解析失败，
+     * 表现为"某几页图固定加载不出来"，而其它域名的图都正常——极难定位。
+     *
+     * 图片链路只会请求图片存储域名（章节图 /static/、头像等），API 域名已在上面
+     * 单独分支处理，所以"非 API 域名 + 有配置 IP"这个判据足够安全：
+     * 用户没配置图片 IP 时（imageIps 为空）仍然回落系统 DNS，行为不变。
+     */
     private fun isImageHost(hostname: String): Boolean {
         if (isApiHost(hostname)) return false
-        return IMAGE_HOST_SUFFIXES.any { hostname.matchesHost(it) }
+        if (imageIpsRef.load().isEmpty()) return false
+        // 已知后缀直接放行；未知后缀同样放行，让新存储节点也能走直连 IP。
+        return true
     }
 
     private fun String.matchesHost(domain: String): Boolean =
         equals(domain, ignoreCase = true) || endsWith(".$domain", ignoreCase = true)
 
     private companion object {
+        /**
+         * 保留为文档/日志用途：这些是已知的图片存储域名后缀。
+         * 判定不再依赖它（见 [isImageHost]），改后缀列表会在服务端换节点时静默失效。
+         */
         val IMAGE_HOST_SUFFIXES = listOf("picacomic.com", "diwodiwo.xyz", "tipatipa.xyz")
     }
 }
