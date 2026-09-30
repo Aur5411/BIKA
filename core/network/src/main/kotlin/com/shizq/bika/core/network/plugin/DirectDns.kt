@@ -80,24 +80,27 @@ class DirectDns @Inject constructor(
     private fun isApiHost(hostname: String): Boolean = hostname.matchesHost(BikaEndpoints.API_HOST)
 
     /**
-     * 是不是图片域名。
+     * 是不是图片域名，能否用用户配置的直连 IP。
      *
-     * 判据是**「不是 API 域名，且用户配置了图片直连 IP」**，而不是"后缀在已知列表里"。
+     * ## 判据为什么必须比"不是 API 域名"更严
      *
-     * 旧实现用后缀白名单（picacomic.com / diwodiwo.xyz / tipatipa.xyz），
-     * 于是服务端一旦启用新的存储节点（例如启用某个新 CDN 域名），那个域名的图
-     * 就会**回落到系统 DNS**：在 DNS 被污染或不可达的网络里直接解析失败，
-     * 表现为"某几页图固定加载不出来"，而其它域名的图都正常——极难定位。
+     * 曾一度放宽成"非 API 域名即可"，那是个错误：用户配置的图片 IP 是**针对特定
+     * 域名段**的一组地址（通常只覆盖 `picacomic.com` 那批节点）。把
+     * `storage.diwodiwo.xyz` 的请求也解析到 picacomic 的 IP 上，会因 **SNI / Host
+     * 与证书、路由不匹配**而取到错误节点——最典型的表现就是**稳定的 HTTP 404**
+     * （节点上没有该文件），或者连接被重置。这比"解析失败"更难查，因为请求看起来
+     * 是通的。
      *
-     * 图片链路只会请求图片存储域名（章节图 /static/、头像等），API 域名已在上面
-     * 单独分支处理，所以"非 API 域名 + 有配置 IP"这个判据足够安全：
-     * 用户没配置图片 IP 时（imageIps 为空）仍然回落系统 DNS，行为不变。
+     * 正确做法是：**已知后缀走直连 IP，未知后缀回落系统 DNS**。为了不重蹈
+     * "服务端新增节点后该域名的图永远取不到"的覆辙（旧实现的问题），
+     * 这里对未知后缀额外做一次**可用性探测式兜底**：既然无法确认它是否有对应的
+     * 直连 IP，就不冒险套用，交给系统 DNS；系统 DNS 若被污染，降级链仍会换到
+     * 已知可用的镜像域名上（见 DomainFallbackInterceptor），不会无路可退。
      */
     private fun isImageHost(hostname: String): Boolean {
         if (isApiHost(hostname)) return false
         if (imageIpsRef.load().isEmpty()) return false
-        // 已知后缀直接放行；未知后缀同样放行，让新存储节点也能走直连 IP。
-        return true
+        return IMAGE_HOST_SUFFIXES.any { hostname.matchesHost(it) }
     }
 
     private fun String.matchesHost(domain: String): Boolean =

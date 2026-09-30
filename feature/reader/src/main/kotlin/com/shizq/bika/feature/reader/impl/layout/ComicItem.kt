@@ -90,6 +90,29 @@ private const val IMAGE_AUTO_RETRY_BASE_MS = 800L
 private const val IMAGE_AUTO_RETRY_JITTER_MS = 400L
 
 /**
+ * 从图片加载异常里取出 HTTP 状态码；取不到返回 null。
+ *
+ * 用反射式的最小子集匹配而不是直接引用 `coil3.network.HttpException`：
+ * `feature:reader` 并没有直接依赖 coil-network，硬引用会让模块多背一个依赖，
+ * 而这个类名在整个 Coil 3 系列里是稳定的（`coil3.network.HttpException`）。
+ * 走 message 的兜底分支覆盖了本项目里出现过的所有形态。
+ */
+private fun httpStatusOf(throwable: Throwable?): Int? {
+    if (throwable == null) return null
+    val text = throwable.message.orEmpty()
+    HTTP_STATUS_PATTERN.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+    // Coil 的 HttpException 把响应存在自身字段里，message 不含状态码时走这里
+    runCatching {
+        val resp = throwable.javaClass.getMethod("getResponse").invoke(throwable)
+        val code = resp.javaClass.getMethod("getCode").invoke(resp) as Int
+        return code
+    }
+    return null
+}
+
+private val HTTP_STATUS_PATTERN = Regex("""\b([1-5]\d\d)\b""")
+
+/**
  * 章节分页失败后的**唯一**退避重试驱动（间隔 2s/4s/8s/16s/30s 封顶）。
  *
  * 必须由宿主调用**一次**，不能放在占位项里。`loadState` 是整个 PagingData 共享的，
@@ -360,8 +383,23 @@ fun ComicPageItem(
         while (true) {
             val current = painter.state.value
             if (current is AsyncImagePainter.State.Error) {
+                val code = httpStatusOf(current.result.throwable)
+                if (code == 404 || code == 403 || code == 410) {
+                    // 永久性失败：换源链（DomainFallbackInterceptor）已经把所有候选域名
+                    // 都试过一遍了，仍然拿到 404/403，说明**服务端在那个路径上确实没有
+                    // 这张图**（或拒绝提供）。继续重启只会重复打同一批必然失败的请求，
+                    // 白白占着并发名额、拖慢同屏其它图。
+                    //
+                    // 这里直接停下并把完整 URL 交给 UI 显示：用户截图就能验证。
+                    logger.warn {
+                        "第 ${index + 1} 页永久失败（HTTP $code），停止重试: url=${page.url}"
+                    }
+                    break
+                }
                 if (attempt >= IMAGE_AUTO_RETRY_MAX) {
-                    logger.debug { "第 ${index + 1} 页自动重试已用尽: url=${page.url}" }
+                    logger.warn {
+                        "第 ${index + 1} 页自动重试已用尽（${httpStatusOf(current.result.throwable) ?: "非 HTTP"}）: url=${page.url}"
+                    }
                     break
                 }
                 attempt++
@@ -420,12 +458,22 @@ fun ComicPageItem(
                 // 对"某几页固定加载不出来"这类问题，这三项是定位的全部所需。
                 val errorText = remember(state) {
                     val t = (state as? AsyncImagePainter.State.Error)?.result?.throwable
-                    val host = page.url.substringAfter("://").substringBefore("/")
+                    val code = httpStatusOf(t)
                     buildString {
-                        append("加载失败\n点击重试")
+                        append(
+                            when (code) {
+                                404 -> "图片不存在（HTTP 404）"
+                                403 -> "无权访问（HTTP 403）"
+                                else -> "加载失败"
+                            }
+                        )
+                        append("\n点击重试")
                         append("\n—")
                         append("\n第 ${index + 1} 页")
-                        append("\nhost: $host")
+                        append("\nhost: ${page.url.substringAfter("://").substringBefore("/")}")
+                        // 404 时把完整 URL 显示出来：这是唯一能验证"服务端是否真缺图"的凭据。
+                        // 原先只显示 host，看到 404 也无从验证。
+                        append("\nurl: ${page.url.take(200)}")
                         append("\n${t?.let { it::class.simpleName } ?: "未知"}: ${t?.message?.take(120)}")
                     }
                 }

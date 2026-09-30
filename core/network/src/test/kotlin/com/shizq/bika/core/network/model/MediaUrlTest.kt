@@ -59,4 +59,42 @@ class MediaUrlTest {
         assertEquals("/static/", media.originalImageUrl)
         assertNull(media.safeImageUrl)
     }
+
+    // ---- 以下用例锁定"必然 404"的两种 URL 形态 ----
+    //
+    // 实测（本机直连图片源）：/static/static/x.jpg 与 /static//x.jpg 都返回 404，
+    // 且这两种形态看起来完全正常，排查时极易漏掉。真实用户报告的"某几页固定
+    // 提示 HTTP 404"里，有一类就是它们造成的。
+
+    @Test
+    fun `path 自带 static 前缀时不会拼出双 static`() {
+        val media = Media(path = "static/abc/1.jpg", fileServer = "https://s3.picacomic.com")
+        assertEquals("https://s3.picacomic.com/static/abc/1.jpg", media.safeImageUrl)
+    }
+
+    @Test
+    fun `path 自带斜杠加 static 前缀时同样归一化`() {
+        val media = Media(path = "/static/abc/1.jpg", fileServer = "https://s3.picacomic.com")
+        assertEquals("https://s3.picacomic.com/static/abc/1.jpg", media.safeImageUrl)
+    }
+
+    @Test
+    fun `fileServer 与 path 都带斜杠时不会出现双斜杠`() {
+        val media = Media(path = "/abc/1.jpg", fileServer = "https://s3.picacomic.com/")
+        val url = media.safeImageUrl
+        assertEquals("https://s3.picacomic.com/static/abc/1.jpg", url)
+        // 双斜杠会被部分 CDN 当成不同路径直接 404，这里显式断言不存在
+        assert(!url!!.substringAfter("://").contains("//")) { "URL 中不应出现双斜杠: $url" }
+    }
+
+    @Test
+    fun `path 只有 static 前缀时被识别为空并返回 null`() {
+        // "static/" 剥掉后什么都不剩，拼出来就是 /static/ 根，必然取不到图
+        assertNull(Media(path = "static/", fileServer = "https://s3.picacomic.com").safeImageUrl)
+    }
+
+    @Test
+    fun `path 只由斜杠组成时返回 null`() {
+        assertNull(Media(path = "///", fileServer = "https://s3.picacomic.com").safeImageUrl)
+    }
 }
