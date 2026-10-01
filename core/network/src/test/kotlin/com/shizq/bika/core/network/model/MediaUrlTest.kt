@@ -97,4 +97,70 @@ class MediaUrlTest {
     fun `path 只由斜杠组成时返回 null`() {
         assertNull(Media(path = "///", fileServer = "https://s3.picacomic.com").safeImageUrl)
     }
+
+    // ---- 以下用例锁定"路径段含空格"这一形态 ----
+    //
+    // 实测（storage-b，4 个边缘 IP 交叉验证，结论一致）：
+    //   /static/sub_storage%201/7f/8b/<uuid>.jpg  -> 403（nginx 原生 403 页，目录不存在）
+    //   /static/sub_storage_1/7f/8b/<uuid>.jpg    -> 200 + 128093 字节
+    // 服务端 path 里的空格是脏数据，真实字符是下划线。放行的话 OkHttp 会编码成
+    // %20 发出去，CDN 侧确定性 403，而 URL"看起来完全正常"，会被误判成"图不存在"。
+
+    @Test
+    fun `路径段中的空格被还原为下划线`() {
+        val media = Media(
+            path = "sub_storage 1/7f/8b/7f8b7261-7509-4aae-88df-9e238ba01e62.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        assertEquals(
+            "https://storage-b.picacomic.com/static/sub_storage_1/7f/8b/7f8b7261-7509-4aae-88df-9e238ba01e62.jpg",
+            media.safeImageUrl,
+        )
+    }
+
+    @Test
+    fun `含空格的路径不会残留编码空格或裸空格`() {
+        val media = Media(
+            path = "sub_storage 1/7f/8b/1.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        val url = media.safeImageUrl!!
+        assert(!url.contains(" ")) { "URL 中不应残留裸空格: $url" }
+        assert(!url.contains("%20")) { "URL 中不应残留 %20: $url" }
+        assert(!url.contains("+")) { "URL 中不应残留 +: $url" }
+    }
+
+    @Test
+    fun `tobs 前缀加空格目录段时两处都正确`() {
+        // 真实形态：path = "tobs/sub_storage 1/7f/8b/xxx.jpg"
+        // 服务端对 /static/tobs/... 会 301 到 /static/...，但空格必须先还原，
+        // 否则重定向目标也带着 %20，一样 403。
+        val media = Media(
+            path = "tobs/sub_storage 1/7f/8b/1.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        assertEquals(
+            "https://storage-b.picacomic.com/static/tobs/sub_storage_1/7f/8b/1.jpg",
+            media.safeImageUrl,
+        )
+    }
+
+    @Test
+    fun `不含空格的正常路径完全不受影响`() {
+        // 回归保护：不能让归一化误伤普通路径。
+        val media = Media(path = "abc/def/1.jpg", fileServer = "https://s3.picacomic.com")
+        assertEquals("https://s3.picacomic.com/static/abc/def/1.jpg", media.safeImageUrl)
+    }
+
+    @Test
+    fun `路径段两侧已有空白仍先被裁掉再归一化`() {
+        val media = Media(
+            path = "  sub_storage 1/1.jpg  ",
+            fileServer = " https://storage-b.picacomic.com ",
+        )
+        assertEquals(
+            "https://storage-b.picacomic.com/static/sub_storage_1/1.jpg",
+            media.safeImageUrl,
+        )
+    }
 }
