@@ -49,6 +49,16 @@ import java.util.concurrent.TimeUnit
  * 整个过程在 Dispatchers.IO 上并发进行，且探测客户端单独收紧了超时（见
  * [probeClient]），不会拖住主流程；失败、超时一律忽略——预热是锦上添花，
  * 做不成也只退回原来的"首图自带一次竞速"，不会更差。
+ * ## 何时调用（v1.11.36 起）
+ *
+ * 两个时机：
+ * 1. **App 启动**（BikaApplication 的后台协程）——首页封面网格是启动后的第一波
+ *    图片流量，旧实现只在进阅读器时才预热，封面全部现场 TLS 握手，一屏十几张
+ *    封面就是十几条连接各等 1 秒多，体感是"封面一片灰、逐个蹦出来"。
+ * 2. **进阅读器**（ReaderViewModel）——旧有路径，保持不变。
+ *
+ * 两次调用靠 [warmedHost] 去重：同目标源不重复建连，启动时预热过的连接
+ * 进阅读器时直接复用；选路结论若在两次之间变了，target 不同会自动对新源重预热。
  */
 @Singleton
 class ImageConnectionWarmup @Inject constructor(
@@ -60,8 +70,12 @@ class ImageConnectionWarmup @Inject constructor(
     private var warmedHost: String? = null
 
     /**
-     * @param connections 预热连接条数。取 6：够覆盖"首图 + 头几张预载"，再多
-     *   就是白占 OkHttp 的同域名请求额度（真正下载要靠那里面的配额）。
+     * @param connections 预热连接条数。取 16：本链路强制 HTTP/1.1（见 NetworkModule
+     *   的 KDoc——HTTP/2 单连接会被 CDN 限速），代价是**每条连接都要单独付一次
+     *   TLS 握手（实测 1.0～1.3 秒）**。首页封面网格一屏就有 10～20 张同时并发，
+     *   旧值 6 只够前 6 张复用热连接，剩下的全部现场握手——这正是"封面加载慢"
+     *   的主因之一。16 条 HEAD 预热只花握手成本、不产生下载流量，且连接在池子里
+     *   idle 5 分钟，首页浏览的整段时间内都够用。
      */
     suspend fun warmUp(connections: Int = WARM_CONNECTIONS) {
         val remembered = router.preferredHost()
@@ -165,7 +179,7 @@ class ImageConnectionWarmup @Inject constructor(
     }
 
     private companion object {
-        const val WARM_CONNECTIONS = 6
+        const val WARM_CONNECTIONS = 16
         const val RACE_TIMEOUT_MS = 4_000L
         const val RACE_CONNECT_TIMEOUT_MS = 2_000L
     }

@@ -14,6 +14,7 @@ import com.shizq.bika.core.coroutine.ApplicationScope
 import com.shizq.bika.core.download.Download
 import com.shizq.bika.core.logging.LoggingConfigurator
 import com.shizq.bika.core.network.dns.DnsAutoSelector
+import com.shizq.bika.core.network.image.ImageConnectionWarmup
 import com.shizq.bika.sync.initializers.Sync
 import com.shizq.bika.util.ProfileVerifierLogger
 import dagger.hilt.android.HiltAndroidApp
@@ -39,6 +40,9 @@ class BikaApplication : Application(), SingletonImageLoader.Factory {
     @ApplicationScope
     lateinit var applicationScope: CoroutineScope
 
+    @Inject
+    lateinit var imageConnectionWarmup: ImageConnectionWarmup
+
     private val logger = KotlinLogging.logger("BikaApplication")
 
     override fun onCreate() {
@@ -62,6 +66,14 @@ class BikaApplication : Application(), SingletonImageLoader.Factory {
         // 进程在落库前被杀时本次调度不生效——下次启动会重新入队，
         // 而两者用的都是 `KEEP` 策略，重复入队是幂等的。
         applicationScope.launch(Dispatchers.IO) {
+            // 连接预热排最前：首页封面网格是启动后的第一波图片流量。
+            // 本链路强制 HTTP/1.1，每条连接都要单独付 1 秒多的 TLS 握手——
+            // 旧实现要等进阅读器才预热，冷启动一进首页，十几张封面全部
+            // 现场握手，体感就是"封面一片灰、逐个蹦出来"。启动时就对
+            // 兜底源摊好 16 条热连接（只花握手成本、不下载流量），
+            // 首屏封面直接复用。详见 ImageConnectionWarmup 的 KDoc。
+            runCatching { imageConnectionWarmup.warmUp() }
+                .onFailure { Log.e("BikaApplication", "Image connection warmup failed", it) }
             runCatching { Sync.initialize(this@BikaApplication) }
                 .onFailure { Log.e("BikaApplication", "Sync initialize failed", it) }
             runCatching { Download.initialize(this@BikaApplication) }
