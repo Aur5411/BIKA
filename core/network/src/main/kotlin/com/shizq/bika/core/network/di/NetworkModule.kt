@@ -16,6 +16,7 @@ import com.shizq.bika.core.network.auth.SessionExpiryReason
 import com.shizq.bika.core.network.auth.SessionManager
 import com.shizq.bika.core.network.auth.sessionExpiryPlugin
 import com.shizq.bika.core.network.dns.appChannelHeaderFor
+import com.shizq.bika.core.network.image.ImageHostHealth
 import com.shizq.bika.core.network.image.ImageHostRouter
 import com.shizq.bika.core.network.image.ImageRateGovernor
 import com.shizq.bika.core.network.image.ImageThrottleInterceptor
@@ -116,6 +117,36 @@ private const val IMAGE_MAX_REQUESTS_PER_HOST = 64
 
 /** 图片全局并发上限：所有图片域名加起来也足够铺满预载窗口。 */
 private const val IMAGE_MAX_REQUESTS = 256
+
+/**
+ * 图片请求的建连超时。
+ *
+ * 取 3 秒：被 DNS 污染或被墙的域名会在 TCP 握手阶段就失败，3 秒足够一个正常
+ * CDN 节点完成 DNS→TCP→TLS 三次握手。它同时决定"跳过死源"要花多久——
+ * 换源串行遍历候选域名时，每个不可达的源都要等满这个值，候选池里有 6 个
+ * 是国内不可达的 picacomic.com 系域名，所以这个值直接乘以 6 才是"每张图
+ * 白等多久"。取 3 秒把最坏情况压在 18 秒以内。
+ */
+private const val IMAGE_CONNECT_TIMEOUT_MS = 3_000L
+
+/**
+ * 图片请求的读取超时。
+ *
+ * 取 30 秒：一次页图有 300~400 KB，慢速移动网络下多花几秒很正常。这个值必须
+ * 足够宽——它一旦偏紧，就会把**正在正常下载**的源误杀，而那正是"某几页固定
+ * 失败"的成因（换源总时限一度因此被拉到 20 秒）。把耐心放在这里，比放在
+ * 外层包一个总的 withTimeout 更准确：超时只针对"两个字节之间"的等待，
+ * 而不是整个下载过程。
+ */
+private const val IMAGE_READ_TIMEOUT_MS = 30_000L
+
+/**
+ * 图片请求的写入超时。
+ *
+ * 图片请求没有请求体，这个值基本不会生效；显式写出来是为了避免落到 OkHttp
+ * 默认值上、让所有超时都在一处可见。
+ */
+private const val IMAGE_WRITE_TIMEOUT_MS = 15_000L
 
 /**
  * 图片解码的并行上限。
@@ -305,6 +336,25 @@ internal object NetworkModule {
                     maxRequestsPerHost = IMAGE_MAX_REQUESTS_PER_HOST
                 }
             )
+            // 分层超时：把「这个源活不活」和「这张图下不下得完」用两个旋钮分开控制。
+            //
+            // 此前这里一个超时都没写，走的是 OkHttp 默认（connect/read 各 10s），
+            // 于是换源串行遍历候选域名时，一个被 DNS 污染的死源要白等到 10s 才放弃：
+            // 候选池 8 个域名里 6 个不可达，光"跳过死源"就要耗掉一分钟，而每张图
+            // 都这么走一遍——`fallbackSlots`（12 个）很快被占满，同屏其它图拿不到
+            // 槽位，表现就是"某几页之后整片失败"。
+            //
+            // - connectTimeout 取 3s：被污染/被墙的域名在 TCP 握手阶段就失败，
+            //   3 秒足够一个正常的 CDN 节点完成 DNS→TCP→TLS；再长只是陪死源干等。
+            // - readTimeout 取 30s：一次页图有 300~400 KB，慢速移动网络下多花几秒
+            //   很正常，读取阶段必须给足，否则会把**正在正常下载**的源误杀
+            //   （这正是换源总时限一度被拉到 20s 的原因——现在由这里承担）。
+            // - callTimeout 不设（0=不限）：整次调用的时限由 Coil 层的
+            //   `FALLBACK_TOTAL_TIMEOUT_MS` 统一控制，两处都设会互相打架，
+            //   反而出现"谁先到谁说话"的难以解释的行为。
+            .connectTimeout(IMAGE_CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .readTimeout(IMAGE_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .writeTimeout(IMAGE_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .addInterceptor { chain ->
                 val request = chain.request().newBuilder()
                     .header("User-Agent", IMAGE_USER_AGENT)
@@ -338,6 +388,7 @@ internal object NetworkModule {
         @ApplicationContext application: Context,
         hostRouter: ImageHostRouter,
         governor: ImageRateGovernor,
+        hostHealth: ImageHostHealth,
     ): ImageLoader = trace("ImageLoader") {
         ImageLoader.Builder(application)
             .memoryCache {
@@ -372,7 +423,7 @@ internal object NetworkModule {
                 // 负责退避重试），再把请求改写到已知最快的源，最后才走降级竞速。
                 add(ImageThrottleInterceptor(governor))
                 add(PreferredHostInterceptor(hostRouter))
-                add(DomainFallbackInterceptor(hostRouter, governor))
+                add(DomainFallbackInterceptor(hostRouter, governor, hostHealth))
             }
             .apply {
                 if (BuildConfig.DEBUG) {

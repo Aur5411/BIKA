@@ -97,10 +97,16 @@ private const val IMAGE_AUTO_RETRY_JITTER_MS = 400L
  * 但单次尝试可能因网络抖动而落空，交给 UI 的往往就是主源那一个 404——
  * 而这张图在 `storage.diwodiwo.xyz` 上其实是好的（已实测 200 + 完整字节）。
  *
- * 取 3：每次重试都会重新走一遍换源链，三次足以穿越一次网络抖动；
- * 又不至于在"服务端确实缺图"时把并发名额长期占住（每次间隔按次数放大）。
+ * 取 2（原为 3）：换源链现在有两处硬化，单次尝试的可靠性显著提高，不再需要
+ * 那么多次"重来一遍"——
+ * - `ImageHostHealth` 会把连续连接失败 2 次的死源隔离 3 分钟，遍历不再陪死源干等；
+ * - `NOT_FOUND_SWEEP_BUDGET_MS` 给每次遍历封了 25 秒总预算。
+ *
+ * 代价核算：最坏情况 2 次重试 → 2 ×（25 秒遍历 + 1.2~2.4 秒间隔）≈ 55 秒。
+ * 取 3 会推到约 85 秒，而这段时间这张"确实缺图"的页一直占着一个并发名额，
+ * 正是「修好第 19 页、第 37/38 页又失败」中"饿死队尾"的放大器。
  */
-private const val IMAGE_NOT_FOUND_RETRY_MAX = 3
+private const val IMAGE_NOT_FOUND_RETRY_MAX = 2
 
 /** 404/403 换源重试的基准间隔，按次数线性放大，避免与普通失败的重试节奏重合。 */
 private const val IMAGE_NOT_FOUND_RETRY_BASE_MS = 1_200L

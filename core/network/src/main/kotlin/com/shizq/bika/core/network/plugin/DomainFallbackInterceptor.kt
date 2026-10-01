@@ -7,6 +7,7 @@ import coil3.request.ErrorResult
 import coil3.request.ImageResult
 import coil3.request.SuccessResult
 import coil3.size.Dimension
+import com.shizq.bika.core.network.image.ImageHostHealth
 import com.shizq.bika.core.network.image.ImageHostRouter
 import com.shizq.bika.core.network.image.ImageHosts
 import com.shizq.bika.core.network.image.ImageRateGovernor
@@ -24,6 +25,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import java.io.IOException
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration.Companion.milliseconds
@@ -45,15 +47,45 @@ private const val SLOW_MAIN_THRESHOLD_MS = 900L
 /**
  * 单个备用域名的**总**请求时限。
  *
- * 为什么从 3000ms 提高到这里：原先 3 秒裹住的是"建连 → 首字节 → 下载完响应体"的
- * 全过程，而常规页图有 300~400 KB，移动网络下 3 秒**下不完**。于是镜像明明有图，
- * 却被当成不可用——竞速全灭后把主源（国内被 DNS 污染、连不上）的错误结果交给 UI，
- * 正是"某几页固定 404、点重试也没用"的成因。
+ * 为什么需要它：把"这个源活不活"和"这张图下不下得完"分开之后（见
+ * `NetworkModule.imageOkHttpClient` 的分层超时：connect 3s / read 30s），
+ * 这里只需要一个不把正常下载误杀的宽上限。
  *
- * 取 20 秒：足够容纳一次正常的慢速整图下载，又不至于让真死的源把这一屏拖住。
- * 竞速阶段各候选域名是并发的，一个死源不会拖慢其它源。
+ * 取值要点：
+ * - 必须显著大于 `IMAGE_READ_TIMEOUT_MS`（30s）**且**给足下载时间，否则会在
+ *   下载途中把活源切断——那正是"某几页固定 404"的成因；
+ * - 又不能太大，因为它同时是"最坏情况下这一发要占住一个 fallbackSlot 多久"。
+ *
+ * 45 秒 = 3s 建连 + 30s 读 + 余量：足以读完一次正常的慢速页图。
  */
-private val FALLBACK_TOTAL_TIMEOUT_MS = 20_000L
+private val FALLBACK_TOTAL_TIMEOUT_MS = 45_000L
+
+/**
+ * 404/403 串行遍历候选域名的**整体**时间预算。
+ *
+ * 为什么必须有这个预算：每张图都占着一个 `fallbackSlots` 名额，而槽位只有 12 个。
+ * 若一张"服务端确实没有"的图把 7 个候选域名逐个耐心试完，它会把一个名额长期占住；
+ * 几张这样的图就能占满全部槽位，同屏其它图（用户实际正看着的那些）连换源的机会
+ * 都拿不到——表现就是"某几页之后整片卡住/失败"。
+ *
+ * 取 25 秒：结合 connect 3s 的分层超时，足够在一个有图的镜像上找到并开始下载
+ * （实测可用的 diwodiwo/tipatipa 排在最前，通常第一次尝试就命中），
+ * 又不会让"确实缺图"的情况长期霸占并发名额。预算用尽后立即把失败交出去，
+ * 由上层按 404 重试策略另行处理。
+ */
+private const val NOT_FOUND_SWEEP_BUDGET_MS = 25_000L
+
+/**
+ * 单条竞速连接的时限。
+ *
+ * 竞速的特点是"只要有一条先回来就够了"，所以对单条连接不需要像串行遍历那样
+ * 给足完整下载时间——但也不能太短，否则慢但能用的源会被提前判失败。
+ *
+ * 取 20 秒：明显短于 [FALLBACK_TOTAL_TIMEOUT_MS]（45s）是因为竞速有 7 条
+ * 同时跑，最坏情况由"最快那条"决定；又不短于一次正常页图下载（300~400KB
+ * 在慢速移动网络约 3~8 秒）加建连余量，避免把活源误杀。
+ */
+private const val RACE_TOTAL_TIMEOUT_MS = 20_000L
 
 /**
  * 经验上在当前网络环境**可直接取到图**的镜像后缀，用于 404/403 串行遍历时排序。
@@ -113,6 +145,8 @@ class DomainFallbackInterceptor(
     private val hostRouter: ImageHostRouter,
     /** 被服务端限流时的全局闸门：限流期间不再并发打其他域名。 */
     private val governor: ImageRateGovernor,
+    /** 域名健康度：把"连接不上的死源"从换源遍历里摘出去，省下每次 3s 的陪等。 */
+    private val hostHealth: ImageHostHealth,
 ) : Interceptor {
     @Volatile
     private var optimalFallbackHost: String? = null
@@ -124,17 +158,31 @@ class DomainFallbackInterceptor(
     }
 
     /**
-     * 降级槽位。
+     * **串行**换源遍历的槽位。
      *
-     * 原先是 2：评论页一屏十几个头像、详情页同时拉封面与章节图时，
-     * 槽位瞬间占满，后面的请求全部阻塞在 `withPermit` 上——
-     * 这才是"图片加载很慢"的放大器。
+     * 串行遍历是"一张图逐个试候选域名"，同时真正在飞的请求数等于"有多少张图
+     * 正在换源"。取 12：一屏 5~8 张图 + 预载窗口若干，12 个足够铺满一屏。
      *
-     * 取 12：候选池有 8 个域名，一次竞速最多同时打 8 条，12 个槽位保证
-     * "一整屏图片同时降级"也不会互相排队；再往上没有意义——槽位不是并发收益，
-     * 只是排队许可，真正的并发上限由图片 OkHttp 的 `maxRequestsPerHost` 决定。
+     * 它**不再被并发竞速占用**（见 [raceSlots]）——原实现里竞速为每个候选域名
+     * 各起一个协程、各自 `withPermit`，一次竞速就能吃掉 7 个名额，同屏两张图
+     * 同时竞速即超过 12，后续图片全部阻塞在 `withPermit` 上饿死。
+     * 这正是"第 19 页修好、第 37/38 页又失败"的机制：**被饿死的永远是队尾那几张**。
      */
     private val fallbackSlots = Semaphore(12)
+
+    /**
+     * **并发竞速**的独立槽位。
+     *
+     * 与 [fallbackSlots] 分开的理由：两者是不同性质的占用。
+     * - 串行遍历：一个名额 = 一张图（持续时间长，要等每发请求收尾）；
+     * - 竞速：一个名额 = 一条连接（持续时间短，谁先回来就撤）。
+     * 混用会让"一屏十张图同时换源"与"其中一张在竞速"互相挤压。
+     *
+     * 取 24：一次竞速最多 7 条并发（候选域名数），24 允许 3 张图同时竞速
+     * 而不互相排队，又给真正的总并发（`IMAGE_MAX_REQUESTS_PER_HOST = 64`）
+     * 留出余量。
+     */
+    private val raceSlots = Semaphore(24)
 
     /**
      * 判断是否小图。
@@ -262,10 +310,39 @@ class DomainFallbackInterceptor(
                     // 1. 本会话竞速选出的最优源（optimalFallbackHost）——已经实测最快；
                     // 2. 域内已知可用的镜像（见 REACHABLE_HOST_HINTS）——按历史经验；
                     // 3. 其余候选——可能是新节点，也可能是不可达的污染域名。
-                    val ordered = candidateHosts.sortedBy { scoreCandidateHost(it) }
+                    //
+                    // 最后再过一道 [ImageHostHealth.orderCandidates]：把"连续连接失败过
+                    // 两次"的域名整体沉到队尾。这是省下"每张图陪 6 个死源各等 3 秒"的
+                    // 关键——死源（DNS 污染）的失败是确定性的，每张图重试它们纯属浪费。
+                    val ordered = hostHealth.orderCandidates(
+                        candidateHosts.sortedBy { scoreCandidateHost(it) }
+                    )
+                    if (hostHealth.quarantinedHosts().isNotEmpty()) {
+                        logger.debug {
+                            "已隔离的不可达源（本轮排在末尾）: ${hostHealth.quarantinedHosts()}"
+                        }
+                    }
+                    // 整体预算：见 NOT_FOUND_SWEEP_BUDGET_MS 的说明。用剩余时间逐发递减，
+                    // 保证"确实缺图"时不会把 fallbackSlot 长期占住、饿死同屏其它图。
+                    val sweepDeadlineMs = System.currentTimeMillis() + NOT_FOUND_SWEEP_BUDGET_MS
                     for (candidateHost in ordered) {
-                        logger.debug { "$statusCode 依次尝试候选域名: $candidateHost" }
-                        val fallbackResult = tryFallbackHost(chain, httpUrl, candidateHost)
+                        val remainingMs = sweepDeadlineMs - System.currentTimeMillis()
+                        if (remainingMs <= 0) {
+                            logger.warn {
+                                "换源预算 ${NOT_FOUND_SWEEP_BUDGET_MS}ms 用尽，停止遍历: $originalUrl"
+                            }
+                            break
+                        }
+                        logger.debug {
+                            "$statusCode 依次尝试候选域名: $candidateHost（剩余 ${remainingMs}ms）"
+                        }
+                        val fallbackResult = tryFallbackHost(
+                            chain, httpUrl, candidateHost,
+                            timeoutMs = remainingMs.coerceAtMost(FALLBACK_TOTAL_TIMEOUT_MS),
+                            // 串行槽位：一个名额代表"这一张图"，与并发竞速的
+                            // "一条连接"分开计，避免遍历 7 个候选时把竞速额度也吃掉。
+                            sequential = true,
+                        )
                         if (fallbackResult != null) {
                             rememberWinner(candidateHost)
                             logger.info { "$statusCode 在镜像 '$candidateHost' 上找到该图，换源成功" }
@@ -326,7 +403,9 @@ class DomainFallbackInterceptor(
         val currentOptimal = optimalFallbackHost
         if (currentOptimal != null && currentOptimal in fallbackHosts) {
             logger.debug { "尝试已知最优域名（快速通道）: $currentOptimal" }
-            val fastResult = tryFallbackHost(chain, httpUrl, currentOptimal)
+            // 快速通道是单发请求（不并发），走串行槽位：它和"串行遍历"一样，
+            // 一个名额代表一张图，持续时间是整个下载过程。
+            val fastResult = tryFallbackHost(chain, httpUrl, currentOptimal, sequential = true)
             if (fastResult != null) {
                 logger.info { "快速通道命中: $currentOptimal" }
                 rememberWinner(currentOptimal)
@@ -346,8 +425,13 @@ class DomainFallbackInterceptor(
         if (sequential) {
             // 串行时顺序即等待时长：把实测可用的源排前面（理由见 scoreCandidateHost），
             // 否则预载与非受管域名要先陪 6 个不可达的 picacomic 系域名各等一次超时。
-            for (host in hostsToRace.sortedBy { scoreCandidateHost(it) }) {
-                val result = tryFallbackHost(chain, httpUrl, host) ?: continue
+            //
+            // 再过一道健康度排序：连续连接失败的域名沉到队尾，省下每张图 3s 的陪等。
+            val ordered = hostHealth.orderCandidates(
+                hostsToRace.sortedBy { scoreCandidateHost(it) }
+            )
+            for (host in ordered) {
+                val result = tryFallbackHost(chain, httpUrl, host, sequential = true) ?: continue
                 rememberWinner(host)
                 return result
             }
@@ -366,13 +450,38 @@ class DomainFallbackInterceptor(
         originalHttpUrl: HttpUrl,
         hostsToRace: List<String>
     ): SuccessResult? = coroutineScope {
-        logger.info { "开始竞速剩余域名: $hostsToRace" }
+        // 竞速前先按健康度排序：把死源排后不是为了让它们"不被试"（并发竞速本来
+        // 就都会试到），而是为了让 [raceSlots] 的额度优先留给活源——当 `raceSlots`
+        // 被多张图同时占满时，排在后面的 job 要等前面的协程退出才拿到名额，
+        // 活源排前面意味着"先拿到名额的是有可能成功的那些"。
+        val ordered = hostHealth.orderCandidates(hostsToRace)
+        logger.info { "开始竞速剩余域名: $ordered" }
 
         val resultChannel = Channel<Pair<String, SuccessResult>>(1)
 
-        val jobs = hostsToRace.map { host ->
+        val jobs = ordered.map { host ->
             launch {
-                val result = tryFallbackHost(chain, originalHttpUrl, host)
+                // 竞速走独立的 [raceSlots]，不占用串行遍历的 [fallbackSlots]。
+                // 这是本轮的关键修复：原实现两者共用 12 个槽位，一次竞速 7 条
+                // 连接就能吃掉大半，同屏两张图同时换源即把槽位占满，
+                // 后续图片（如第 37/38 页）全部阻塞在 withPermit 上饿死。
+                val result = raceSlots.withPermit {
+                    withTimeoutOrNull(RACE_TOTAL_TIMEOUT_MS.milliseconds) {
+                        withContext(FallbackMarker()) {
+                            val newUrl = originalHttpUrl.newBuilder().host(host).build().toString()
+                            val newRequest = chain.request.newBuilder().data(newUrl).build()
+                            try {
+                                val r = chain.withRequest(newRequest).proceed()
+                                hostHealth.noteReachable(host)
+                                r as? SuccessResult
+                            } catch (e: Exception) {
+                                if (e is CancellationException) throw e
+                                noteTransportFailure(host, e)
+                                null
+                            }
+                        }
+                    }
+                }
                 if (result != null) {
                     resultChannel.trySend(host to result)
                 }
@@ -403,6 +512,20 @@ class DomainFallbackInterceptor(
     }
 
     /**
+     * 记一次**连接层**失败。
+     *
+     * 只有"压根没拿到 HTTP 响应"的失败才算：超时、DNS 解析失败、连接被拒/重置。
+     * 拿到任何 HTTP 状态码（含 404/403/5xx）都说明源是可达的，由调用方
+     * 走 [ImageHostHealth.noteReachable]——把 404 也算成"源不可用"会让好源被误杀。
+     */
+    private fun noteTransportFailure(host: String, e: Throwable) {
+        if (e is coil3.network.HttpException) return
+        if (e is IOException || e is java.net.UnknownHostException) {
+            hostHealth.noteUnreachable(host)
+        }
+    }
+
+    /**
      * 候选域名的尝试优先级，**分数越小越先试**。
      *
      * 只用于 404/403 的串行遍历（并发竞速不需要顺序）。之所以需要它：
@@ -426,45 +549,50 @@ class DomainFallbackInterceptor(
     /**
      * 单个备用域名的请求封装。
      *
-     * ## 超时为什么不能裹住整个 proceed()
+     * ## 超时语义
      *
-     * 曾经这里是 `withTimeoutOrNull(3000ms) { proceed() }`，但那包裹的是**从建连到
-     * 响应体下载完成**的全过程。一张常规页图有 300~400 KB，在移动网络下多花几秒是
-     * 常态——于是真正**有这张图**的镜像会在"下载到一半"时被判定失败，竞速全灭，
-     * 最终把主源（国内被 DNS 污染、根本连不上）的错误结果交给用户，表现就是
-     * **某几页固定报 HTTP 404 且怎么重试都一样**。
+     * 传进来的 [timeoutMs] 是**整次调用**的上限（建连 + 下载），默认
+     * [FALLBACK_TOTAL_TIMEOUT_MS]。它必须宽到不会把正在正常下载的源切断——
+     * 曾经这里是 `withTimeoutOrNull(3000ms) { proceed() }`，而 Coil 的 `proceed()`
+     * 覆盖"建连 → 首字节 → 下载完响应体"全过程，一张 300~400 KB 的页图在移动网络下
+     * 3 秒**下不完**，于是真正有图的镜像被判失败、竞速全灭，最终把主源（国内被
+     * DNS 污染、连不上）的错误结果交给用户，表现就是"某几页固定 404 且重试无效"。
      *
-     * 超时该约束的是"这个源到底活不活"，也就是**首字节什么时候到**；一旦开始收数据，
-     * 就该让它读完——读取阶段的耐心由 OkHttp 自己的 readTimeout 决定。
+     * "快速跳过死源"的职责已经交给 OkHttp 的分层超时（connectTimeout 3s，
+     * 见 `NetworkModule.imageOkHttpClient`），不需要在这里再用一个短超时去兼任，
+     * 那只会把两类完全不同的失败混为一谈。
      *
-     * 实现上分两段：
-     * 1. 用 [FALLBACK_FIRST_BYTE_TIMEOUT_MS] 限制"建连 + 首字节"，超时即判该源不可用；
-     * 2. 拿到响应后就让它自然跑完（下面的 await 不再加时限）。
-     *
-     * 由于 Coil 的 `proceed()` 是一整个 suspend 调用、内部不暴露"首字节"回调，
-     * 这里用 [FALLBACK_TOTAL_TIMEOUT_MS] 作为**总时长**兜底——它必须显著大于
-     * 首字节超时，才能容忍慢速下载；两者共同保证：既不会对一个死源干等太久，
-     * 也不会把正在正常下载的源误杀。
+     * @param timeoutMs 本次尝试的总时限；由调用方按剩余预算传入，便于串行遍历
+     *   在多张坏图上不至于无限累积。
+     * @param sequential 是否来自串行遍历。true 时占用 [fallbackSlots]（一个名额=一张图），
+     *   false 时占用 [raceSlots]（一个名额=一条连接）。两者分开是为了消除槽位争抢。
      */
     private suspend fun tryFallbackHost(
         chain: Interceptor.Chain,
         originalUrl: HttpUrl,
-        newHost: String
+        newHost: String,
+        timeoutMs: Long = FALLBACK_TOTAL_TIMEOUT_MS,
+        sequential: Boolean = false,
     ): SuccessResult? {
         val newUrl = originalUrl.newBuilder().host(newHost).build().toString()
         val newRequest = chain.request.newBuilder().data(newUrl).build()
 
+        val slots = if (sequential) fallbackSlots else raceSlots
         return try {
-            fallbackSlots.withPermit {
-                withTimeoutOrNull(FALLBACK_TOTAL_TIMEOUT_MS.milliseconds) {
+            slots.withPermit {
+                withTimeoutOrNull(timeoutMs.milliseconds) {
                     withContext(FallbackMarker()) {
                         val result = chain.withRequest(newRequest).proceed()
+                        // 拿到任何 HTTP 响应（含 404/403/5xx）都说明源可达——
+                        // 它能在别张图上派上用场，必须解除隔离。
+                        hostHealth.noteReachable(newHost)
                         result as? SuccessResult
                     }
                 }
             }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
+            noteTransportFailure(newHost, e)
             null
         }
     }
