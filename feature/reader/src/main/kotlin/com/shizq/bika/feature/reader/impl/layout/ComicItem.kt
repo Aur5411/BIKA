@@ -42,6 +42,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -161,6 +162,38 @@ internal fun httpStatusOf(throwable: Throwable?): Int? {
 internal val HTTP_STATUS_PATTERN = Regex(
     """(?i)(?:http[/ ]?\d?\.?\d?\s*|code\s*[=:]\s*|status\s*[=:]?\s*|状态码\s*[=:]?\s*|\(|\s)([1-5]\d\d)(?:\s|$|[),;])"""
 )
+
+/**
+ * 把 `path` 里"看不见但真实存在"的字符挑出来，做成紧凑的码位清单。
+ *
+ * ## 为什么需要它
+ *
+ * 服务端返回的 `path` 里混入过不可见字符（典型：目录段本应是 `sub_storage_1`，
+ * 实际带一个 U+0020 普通空格）。这类问题的排查难度全在**它渲染出来与正常内容
+ * 无法区分**——截图、复制、肉眼比对都看不出差别，只能靠码位。
+ *
+ * 报错界面是用户唯一能带回来的现场，所以把码位直接算好显示在上面：
+ * 用户截一张图就等于提供了完整的原始数据，不必再靠反复追问或连接 adb。
+ *
+ * 只列可疑字符与其下标，不做整段 dump——整段码位太长，塞不进屏幕上的小方框。
+ * 判定标准是"可打印 ASCII（0x21–0x7E）之外的一切"，因此 U+0020 也会被列出
+ * （路径里本来就不该有空格）；CJK 路径同理会被列出，但这只影响诊断可读性。
+ */
+internal fun describeSuspiciousPathChars(path: String): String {
+    if (path.isEmpty()) return ""
+    return buildList {
+        path.forEachIndexed { index, c ->
+            if (c.code !in ASCII_PRINTABLE_START..ASCII_PRINTABLE_END) {
+                val hex = c.code.toString(16).uppercase().padStart(4, '0')
+                val name = runCatching { Character.getName(c.code) }.getOrNull()
+                add("[$index]U+$hex${name?.let { "($it)" } ?: ""}")
+            }
+        }
+    }.joinToString(" ")
+}
+
+private const val ASCII_PRINTABLE_START = 0x21
+private const val ASCII_PRINTABLE_END = 0x7E
 
 /**
  * 章节分页失败后的**唯一**退避重试驱动（间隔 2s/4s/8s/16s/30s 封顶）。
@@ -378,6 +411,17 @@ fun ComicPageItem(
 
     val configuration = LocalConfiguration.current
     val platformContext = LocalPlatformContext.current
+    // 把当前安装包的版本号打进报错文案。
+    //
+    // 起因：同一条"图片不存在"的报告反复出现，而修复早已在某个版本里生效——
+    // 无法区分"用户装的还是旧包"还是"修复没生效"，只能靠反复追问。把它显示在
+    // 失败卡片上，截图自带版本号，一步就能排除掉"装的不是这一版"这种可能。
+    val context = LocalContext.current
+    val appVersion = remember(context) {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: "?"
+    }
     val contentScale = if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
         ContentScale.Fit
     } else {
@@ -530,7 +574,7 @@ fun ComicPageItem(
                 // 失败详情直接显示在屏幕上（而不是只写日志）：用户截图就能把
                 // 「真实 URL + 域名 + 具体错误」带回来，不必接 adb 抓 logcat。
                 // 对"某几页固定加载不出来"这类问题，这三项是定位的全部所需。
-                val errorText = remember(state) {
+                val errorText = remember(state, page.rawPath, appVersion) {
                     val t = (state as? AsyncImagePainter.State.Error)?.result?.throwable
                     val code = httpStatusOf(t)
                     buildString {
@@ -543,11 +587,21 @@ fun ComicPageItem(
                         )
                         append("\n点击重试")
                         append("\n—")
-                        append("\n第 ${index + 1} 页")
+                        append("\n第 ${index + 1} 页  ·  v$appVersion")
                         append("\nhost: ${page.url.substringAfter("://").substringBefore("/")}")
                         // 404 时把完整 URL 显示出来：这是唯一能验证"服务端是否真缺图"的凭据。
                         // 原先只显示 host，看到 404 也无从验证。
                         append("\nurl: ${page.url.take(200)}")
+                        // 服务端原始 path 里有不可见字符时，把它的码位一并显示出来。
+                        //
+                        // `url` 是**归一化之后**的结果，看起来永远是干净的——只凭它
+                        // 无法判断"是我们拼错还是服务端数据脏"。原始 path 的码位清单
+                        // 是区分这两者的唯一凭据，且只在真的可疑时才多占一行。
+                        val suspicious = describeSuspiciousPathChars(page.rawPath)
+                        if (suspicious.isNotEmpty()) {
+                            append("\n原始 path: ${page.rawPath.take(120)}")
+                            append("\n可疑字符: $suspicious")
+                        }
                         append("\n${t?.let { it::class.simpleName } ?: "未知"}: ${t?.message?.take(120)}")
                     }
                 }

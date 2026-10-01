@@ -305,7 +305,13 @@ internal fun toChapterPageOrNull(
         }
         return null
     }
-    return ChapterPage(id = image.imageId, url = url)
+    // rawPath 原样保留服务端给的 path（可能是脏的）。
+    //
+    // 为什么要带下去：阅读器在加载失败时会把诊断信息显示在屏幕上，而 [url] 是
+    // **归一化之后**的结果——用户看到的地址总是"干净"的，无法据此判断服务端到底
+    // 给了什么。把原始值一并带下去，报错界面才能同时打印"请求了什么"和
+    // "服务端给的是什么"，这是区分"我们拼错"与"服务端数据脏"的唯一凭据。
+    return ChapterPage(id = image.imageId, url = url, rawPath = image.media.path)
 }
 
 data class ChapterMeta(
@@ -313,7 +319,16 @@ data class ChapterMeta(
     val totalImages: Int
 )
 
+/**
+ * 阅读器里的一页。
+ *
+ * @property rawPath 服务端**原始**给的 `path`（未做任何归一化）。
+ *   仅供失败时在界面上自证用：归一化会掩盖"数据本来是什么样"，
+ *   而这个信息正是判断"是我们拼错还是服务端脏"的唯一依据。
+ *   离线模式（本地文件）没有这个概念，留空。
+ */
 data class ChapterPage(
     val id: String,
     val url: String,
+    val rawPath: String = "",
 )

@@ -1,6 +1,8 @@
 package com.shizq.bika.core.network.image
 
 import coil3.intercept.Interceptor
+import coil3.network.HttpException
+import coil3.request.ErrorResult
 import coil3.request.ImageResult
 import io.github.oshai.kotlinlogging.KotlinLogging
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -8,18 +10,29 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 private val logger = KotlinLogging.logger("ImagePathGuard")
 
 /**
- * 图片链路最外层：把 URL 里不可见的脏字符治掉再放行。
+ * 图片链路最外层：把 URL 里不可见的脏字符治掉；治完仍取不到图时，
+ * 再退回「服务端原样路径」试一次。
  *
  * ## 它守的是什么
  *
- * 服务端 `path` 字段里会混入不可见字符（典型：目录段本应是 `sub_storage_1`，
- * 实际给的却带一个渲染上看不见的空白）。这种 URL 一路畅通无阻——拼接不报错、
- * 编码不报错、请求发得出去，但 CDN 上那个目录根本不存在，结果是**确定性 403**，
- * 在 UI 上被笼统地报成"图片不存在"。
+ * 服务端 `path` 字段里会混入不可见字符（实测：目录段本应是 `sub_storage_1`，
+ * 服务端给的却带一个 **U+0020 普通空格**，在屏幕上与正常空格无法区分）。
+ * 这种 URL 一路畅通无阻——拼接不报错、编码不报错、请求发得出去，
+ * 但 CDN 上那个目录根本不存在，于是确定性失败，UI 上被笼统报成"图片不存在"。
  *
- * `Media.safeImageUrl` 已经在源头修过，但取图片地址的调用点不止一处
- * （封面/头像走的是保留原样的 `originalImageUrl`）。放在链首就等于不依赖
- * 调用方自觉：只要最终请求的是 `/static/` 图片，进网络前一定被治过。
+ * ## 为什么"归一化"之外还要留一条回退路
+ *
+ * "把不可见字符换成下划线"是一个**基于实测的强假设**：我们验证过
+ * `sub_storage%201` 在多个源、多个边缘节点上全部 403/404，而 `sub_storage_1`
+ * 全部 200。但它终究是假设——谁也不能保证源站永远只有下划线那一种拼法。
+ *
+ * 所以这里不退化成"赌一种拼法"：先按归一化后的形态请求，**只有它返回
+ * 403/404 时**，才用服务端原样给的路径再试一次，两条路都走完才判定失败。
+ * 这样服务端日后无论改成哪种拼法，应用都能自己走出来，不必再发一版。
+ *
+ * 额外开销可控：正常情况（归一化后成功）**一次请求都不多**；只有已经失败的图
+ * 才各多花一次，且外层 `DomainFallbackInterceptor` 对每次请求都有整体预算，
+ * UI 侧重试另有退避，不会指数放大。
  *
  * ## 位置
  *
@@ -39,15 +52,32 @@ internal class ImagePathGuardInterceptor : Interceptor {
         if (!data.startsWith("http", ignoreCase = true)) return chain.proceed()
 
         val url = data.toHttpUrlOrNull() ?: return chain.proceed()
-        val fixed = url.sanitizeStaticImagePath() ?: return chain.proceed()
+        // 没有脏字符可修（或不是 /static/ 章节图）→ 原样放行，不做任何多余动作。
+        val sanitized = url.sanitizeStaticImagePath() ?: return chain.proceed()
 
         logger.warn {
             "图片路径含不可见字符，已归一化：" +
-                "${url.encodedPath} -> ${fixed.encodedPath}"
+                "${url.encodedPath} -> ${sanitized.encodedPath}"
         }
 
-        return chain.withRequest(
-            chain.request.newBuilder().data(fixed.toString()).build(),
-        ).proceed()
+        val sanitizedRequest = chain.request.newBuilder().data(sanitized.toString()).build()
+        val result = chain.withRequest(sanitizedRequest).proceed()
+        if (result !is ErrorResult) return result
+
+        // 只有 403/404 才值得换拼法重来：其它错误（超时、5xx、限流）与路径无关，
+        // 换路径不会让它们变好，只会白花一次请求。
+        val code = (result.throwable as? HttpException)?.response?.code
+        if (code != HTTP_FORBIDDEN && code != HTTP_NOT_FOUND) return result
+
+        logger.warn {
+            "归一化后仍失败（HTTP $code），改用服务端原样路径再试一次: ${url.encodedPath}"
+        }
+        // chain.proceed() 用的是原始 data —— 即服务端给的、未归一化的那条。
+        return chain.proceed()
+    }
+
+    private companion object {
+        const val HTTP_FORBIDDEN = 403
+        const val HTTP_NOT_FOUND = 404
     }
 }
