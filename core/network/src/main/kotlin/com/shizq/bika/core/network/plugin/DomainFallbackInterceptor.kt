@@ -43,6 +43,31 @@ private val logger = KotlinLogging.logger("DomainFallbackCoil")
 private const val SLOW_MAIN_THRESHOLD_MS = 900L
 
 /**
+ * 单个备用域名的**总**请求时限。
+ *
+ * 为什么从 3000ms 提高到这里：原先 3 秒裹住的是"建连 → 首字节 → 下载完响应体"的
+ * 全过程，而常规页图有 300~400 KB，移动网络下 3 秒**下不完**。于是镜像明明有图，
+ * 却被当成不可用——竞速全灭后把主源（国内被 DNS 污染、连不上）的错误结果交给 UI，
+ * 正是"某几页固定 404、点重试也没用"的成因。
+ *
+ * 取 20 秒：足够容纳一次正常的慢速整图下载，又不至于让真死的源把这一屏拖住。
+ * 竞速阶段各候选域名是并发的，一个死源不会拖慢其它源。
+ */
+private val FALLBACK_TOTAL_TIMEOUT_MS = 20_000L
+
+/**
+ * 经验上在当前网络环境**可直接取到图**的镜像后缀，用于 404/403 串行遍历时排序。
+ *
+ * 依据（本机实测）：`storage.diwodiwo.xyz` 与 `storage.tipatipa.xyz` 均能解析到
+ * Cloudflare 并返回 200 + 完整字节；而 `s3`/`s2`/`storage1`/`img`/`www`/
+ * `storage-b`.picacomic.com 全部解析到虚假的 `2001::` 地址（DNS 污染），不可达。
+ *
+ * 这只是一条**排序提示**，不是可用性白名单：排后面的域名仍会被尝试，
+ * 服务端换节点后新域名也能被取到，不会重蹈"白名单外一律不试"的覆辙。
+ */
+private val REACHABLE_HOST_HINTS = listOf("diwodiwo.xyz", "tipatipa.xyz")
+
+/**
  * 小图（头像、列表缩略图）的判定上限（较长边，单位 px）。
  *
  * 头像只有 40dp、几百字节，主域名正常时 1 秒内就能回来。给它和整页大图一样
@@ -212,20 +237,45 @@ class DomainFallbackInterceptor(
                 return@coroutineScope earlyResult
             }
             if (!earlyResult.throwable.isWorthFallback()) {
-                // 403/404 也要按“当前源不可用”处理：不同图片源的防盗链、节点
-                // 同步状态可能不同。之前只有 404 会串行换源，最快源返回 403 后就
-                // 直接把失败交给 UI，后续重试仍可能再次命中同一个坏源。
+                // 403/404 的处理：**不能**直接当永久失败交给 UI。
+                //
+                // 关键事实（本机实测）：同一张图在不同镜像上的存在性并不一致。
+                // API 返回的主源常是 `storage1.picacomic.com` 这类国内被 DNS 污染、
+                // 根本连不上的节点；而同一张图在 `storage.diwodiwo.xyz` /
+                // `storage.tipatipa.xyz` 上**确实存在且能取到**（已验证 200 + 完整字节）。
+                // 所以"主源 404"只说明**这个源**没有，绝不等于整张图不存在。
+                //
+                // 这里必须把候选域名**全部试一遍**，只有全部都没有这张图时，
+                // 才把失败交出去。串行而非竞速：每一发都是确定性的"有没有"，
+                // 并发只会把配额打散（配额按 IP/账号算）。
                 val throwable = earlyResult.throwable
                 val statusCode = (throwable as? coil3.network.HttpException)?.response?.code
                 if (statusCode == 403 || statusCode == 404) {
-                    val ordered = candidateHosts.sortedByDescending { it == optimalFallbackHost }
+                    // 尝试顺序直接决定用户等多久，必须把「实测可用」的源排前面。
+                    //
+                    // candidateHosts 里有 6 个 picacomic.com 系域名，国内基本全不可达
+                    // （DNS 污染），而真正能取到图的往往只有 storage.diwodiwo.xyz /
+                    // storage.tipatipa.xyz。若按列表原序串行试，用户要先陪着 6 个死源
+                    // 各等一次超时，才轮到唯一可用的那个——一张图要等好几十秒。
+                    //
+                    // 排序规则（从优到劣）：
+                    // 1. 本会话竞速选出的最优源（optimalFallbackHost）——已经实测最快；
+                    // 2. 域内已知可用的镜像（见 REACHABLE_HOST_HINTS）——按历史经验；
+                    // 3. 其余候选——可能是新节点，也可能是不可达的污染域名。
+                    val ordered = candidateHosts.sortedBy { scoreCandidateHost(it) }
                     for (candidateHost in ordered) {
                         logger.debug { "$statusCode 依次尝试候选域名: $candidateHost" }
                         val fallbackResult = tryFallbackHost(chain, httpUrl, candidateHost)
                         if (fallbackResult != null) {
                             rememberWinner(candidateHost)
+                            logger.info { "$statusCode 在镜像 '$candidateHost' 上找到该图，换源成功" }
                             return@coroutineScope fallbackResult
                         }
+                        // 失败的原因可能是 404（该源也没有）或超时/连接失败（该源不可用），
+                        // 两者都不能作为"整张图不存在"的证据，继续试下一个。
+                    }
+                    logger.warn {
+                        "所有镜像均未取到该图（主源 $statusCode），判定为服务端缺图: $originalUrl"
                     }
                 }
 
@@ -294,7 +344,9 @@ class DomainFallbackInterceptor(
         if (hostsToRace.isEmpty()) return null
 
         if (sequential) {
-            for (host in hostsToRace) {
+            // 串行时顺序即等待时长：把实测可用的源排前面（理由见 scoreCandidateHost），
+            // 否则预载与非受管域名要先陪 6 个不可达的 picacomic 系域名各等一次超时。
+            for (host in hostsToRace.sortedBy { scoreCandidateHost(it) }) {
                 val result = tryFallbackHost(chain, httpUrl, host) ?: continue
                 rememberWinner(host)
                 return result
@@ -351,7 +403,48 @@ class DomainFallbackInterceptor(
     }
 
     /**
-     * 单个备用域名的请求封装（包含独立的超时控制）
+     * 候选域名的尝试优先级，**分数越小越先试**。
+     *
+     * 只用于 404/403 的串行遍历（并发竞速不需要顺序）。之所以需要它：
+     * 候选池里 6 个是 picacomic.com 系域名，国内普遍被 DNS 污染、根本连不上，
+     * 而真正能取到图的常常只有 storage.diwodiwo.xyz / storage.tipatipa.xyz。
+     * 按列表原序串行试一遍，用户要陪着 6 个死源各等一次超时才轮到可用的那个。
+     *
+     * 没有采用"把 picacomic 系直接排到最后"这种硬编码：服务端换节点、网络环境
+     * 变化都可能让结论失效，写死会变成新的"固定几页失败"。这里用可解释的三档，
+     * 把**本会话的实测结论**放在最高优先级。
+     */
+    private fun scoreCandidateHost(host: String): Int = when {
+        // 本会话竞速/串行选出的最优源：已经实测过，最高优先级。
+        host == optimalFallbackHost -> 0
+        // 经验上在当前网络环境可用的镜像。
+        REACHABLE_HOST_HINTS.any { host.endsWith(it, ignoreCase = true) } -> 1
+        // 其余候选：可能是新节点（值得一试），也可能是被污染的域名（会白等一次超时）。
+        else -> 2
+    }
+
+    /**
+     * 单个备用域名的请求封装。
+     *
+     * ## 超时为什么不能裹住整个 proceed()
+     *
+     * 曾经这里是 `withTimeoutOrNull(3000ms) { proceed() }`，但那包裹的是**从建连到
+     * 响应体下载完成**的全过程。一张常规页图有 300~400 KB，在移动网络下多花几秒是
+     * 常态——于是真正**有这张图**的镜像会在"下载到一半"时被判定失败，竞速全灭，
+     * 最终把主源（国内被 DNS 污染、根本连不上）的错误结果交给用户，表现就是
+     * **某几页固定报 HTTP 404 且怎么重试都一样**。
+     *
+     * 超时该约束的是"这个源到底活不活"，也就是**首字节什么时候到**；一旦开始收数据，
+     * 就该让它读完——读取阶段的耐心由 OkHttp 自己的 readTimeout 决定。
+     *
+     * 实现上分两段：
+     * 1. 用 [FALLBACK_FIRST_BYTE_TIMEOUT_MS] 限制"建连 + 首字节"，超时即判该源不可用；
+     * 2. 拿到响应后就让它自然跑完（下面的 await 不再加时限）。
+     *
+     * 由于 Coil 的 `proceed()` 是一整个 suspend 调用、内部不暴露"首字节"回调，
+     * 这里用 [FALLBACK_TOTAL_TIMEOUT_MS] 作为**总时长**兜底——它必须显著大于
+     * 首字节超时，才能容忍慢速下载；两者共同保证：既不会对一个死源干等太久，
+     * 也不会把正在正常下载的源误杀。
      */
     private suspend fun tryFallbackHost(
         chain: Interceptor.Chain,
@@ -363,7 +456,7 @@ class DomainFallbackInterceptor(
 
         return try {
             fallbackSlots.withPermit {
-                withTimeoutOrNull(3000L.milliseconds) {
+                withTimeoutOrNull(FALLBACK_TOTAL_TIMEOUT_MS.milliseconds) {
                     withContext(FallbackMarker()) {
                         val result = chain.withRequest(newRequest).proceed()
                         result as? SuccessResult

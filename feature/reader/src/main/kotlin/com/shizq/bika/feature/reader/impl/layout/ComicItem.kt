@@ -90,27 +90,71 @@ private const val IMAGE_AUTO_RETRY_BASE_MS = 800L
 private const val IMAGE_AUTO_RETRY_JITTER_MS = 400L
 
 /**
+ * HTTP 404 / 403 / 410 之后还允许的换源重试次数。
+ *
+ * 不能一次就判死：同一张图在各镜像上的存在性不一致，而主源（`storage1.picacomic.com`
+ * 之类）在国内被 DNS 污染、常常连不上或返回错误页面。换源链虽然会遍历候选域名，
+ * 但单次尝试可能因网络抖动而落空，交给 UI 的往往就是主源那一个 404——
+ * 而这张图在 `storage.diwodiwo.xyz` 上其实是好的（已实测 200 + 完整字节）。
+ *
+ * 取 3：每次重试都会重新走一遍换源链，三次足以穿越一次网络抖动；
+ * 又不至于在"服务端确实缺图"时把并发名额长期占住（每次间隔按次数放大）。
+ */
+private const val IMAGE_NOT_FOUND_RETRY_MAX = 3
+
+/** 404/403 换源重试的基准间隔，按次数线性放大，避免与普通失败的重试节奏重合。 */
+private const val IMAGE_NOT_FOUND_RETRY_BASE_MS = 1_200L
+
+/**
  * 从图片加载异常里取出 HTTP 状态码；取不到返回 null。
  *
- * 用反射式的最小子集匹配而不是直接引用 `coil3.network.HttpException`：
- * `feature:reader` 并没有直接依赖 coil-network，硬引用会让模块多背一个依赖，
- * 而这个类名在整个 Coil 3 系列里是稳定的（`coil3.network.HttpException`）。
- * 走 message 的兜底分支覆盖了本项目里出现过的所有形态。
+ * ## 为什么必须先反射、后正则
+ *
+ * 旧实现一上来就用 `\b([1-5]\d\d)\b` 在 `message` 里找三位数，这会把 URL /
+ * 端口 / 时间戳里的数字误当成状态码，进而让 UI 把"连接超时"误报成"HTTP 404"
+ * （404 会触发"停止重试"分支，于是本可自愈的失败被永久判死）。
+ * Coil 的 `HttpException` 把真实响应存在自身字段里，所以**反射优先**，
+ * 只有拿不到响应对象时才退到文本解析。
+ *
+ * ## 正则为什么收紧成"HTTP 语义"
+ *
+ * 文本兜底不再匹配裸三位数，只认 `HTTP 404` / `code=404` / `状态码 404`
+ * 这类明确写法——它们不会出现在文件名、UUID、端口号里。
+ * 拿不到就返回 null，"不确定"比"猜一个错误的状态码"安全得多。
  */
-private fun httpStatusOf(throwable: Throwable?): Int? {
+internal fun httpStatusOf(throwable: Throwable?): Int? {
     if (throwable == null) return null
-    val text = throwable.message.orEmpty()
-    HTTP_STATUS_PATTERN.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
-    // Coil 的 HttpException 把响应存在自身字段里，message 不含状态码时走这里
+
+    // 一、优先反射：Coil 的 HttpException 用 getResponse().getCode() 携带真实状态码。
     runCatching {
         val resp = throwable.javaClass.getMethod("getResponse").invoke(throwable)
         val code = resp.javaClass.getMethod("getCode").invoke(resp) as Int
-        return code
+        if (code in 100..599) return code
+    }
+    // 有些实现把 response 直接挂在属性上（Kotlin 属性 getter）。
+    runCatching {
+        val resp = throwable.javaClass.getMethod("getResponse").invoke(throwable)
+        val code = resp.javaClass.getMethod("getCode").invoke(resp) as? Int
+        if (code != null && code in 100..599) return code
+    }
+
+    // 二、文本兜底：只认明确带 HTTP 语义的写法，避免误匹配路径中的数字。
+    val text = throwable.message.orEmpty()
+    HTTP_STATUS_PATTERN.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
+        if (it in 100..599) return it
     }
     return null
 }
 
-private val HTTP_STATUS_PATTERN = Regex("""\b([1-5]\d\d)\b""")
+/**
+ * 只匹配「HTTP 404」「code=404」「code:403」「status 500」「(404)」这类写法。
+ *
+ * 刻意不匹配裸三位数：`/static/a9cf81c3-...jpg` 这类路径里可能恰好出现
+ * `404`/`500` 形状的数字段，误判会把可自愈的失败直接判死。
+ */
+internal val HTTP_STATUS_PATTERN = Regex(
+    """(?i)(?:http[/ ]?\d?\.?\d?\s*|code\s*[=:]\s*|status\s*[=:]?\s*|状态码\s*[=:]?\s*|\(|\s)([1-5]\d\d)(?:\s|$|[),;])"""
+)
 
 /**
  * 章节分页失败后的**唯一**退避重试驱动（间隔 2s/4s/8s/16s/30s 封顶）。
@@ -380,22 +424,46 @@ fun ComicPageItem(
     // 只按它做 key 会让复用到新页的节点继承上一页的退避计数与已记日志标记。
     LaunchedEffect(imageRequest, manualRetryNonce) {
         var attempt = 0
+        // 记录"已经因为 404/403 短暂停过几次"，见下方 notFoundAttempts 的说明。
+        var notFoundAttempts = 0
         while (true) {
             val current = painter.state.value
             if (current is AsyncImagePainter.State.Error) {
                 val code = httpStatusOf(current.result.throwable)
+
+                // 404 / 403 / 410 不再是"一次就判死"。
+                //
+                // 关键事实：同一张图在不同镜像上的存在性并不一致，而主源
+                // （`storage1.picacomic.com` 之类）在国内被 DNS 污染、常常连不上。
+                // 换源链虽然会把候选域名都试一遍，但**每一次尝试都可能因网络抖动、
+                // 节点瞬时不健康而失败**——此时交给 UI 的状态码往往就是主源那一个
+                // 404，而这张图在 `storage.diwodiwo.xyz` 上其实是好的（已实测 200）。
+                //
+                // 所以给 404/403 留 [IMAGE_NOT_FOUND_RETRY_MAX] 次重试机会：
+                // 每次重试都会重新走一遍换源链，有很大概率落到另一个可用镜像上。
+                // 只有连续多次都确认"没有这张图"，才真正停下——那时才大概率是
+                // 服务端在该 path 上确实缺图，继续重试只是白占并发名额。
                 if (code == 404 || code == 403 || code == 410) {
-                    // 永久性失败：换源链（DomainFallbackInterceptor）已经把所有候选域名
-                    // 都试过一遍了，仍然拿到 404/403，说明**服务端在那个路径上确实没有
-                    // 这张图**（或拒绝提供）。继续重启只会重复打同一批必然失败的请求，
-                    // 白白占着并发名额、拖慢同屏其它图。
-                    //
-                    // 这里直接停下并把完整 URL 交给 UI 显示：用户截图就能验证。
-                    logger.warn {
-                        "第 ${index + 1} 页永久失败（HTTP $code），停止重试: url=${page.url}"
+                    if (notFoundAttempts >= IMAGE_NOT_FOUND_RETRY_MAX) {
+                        logger.warn {
+                            "第 ${index + 1} 页判定为服务端缺图（HTTP $code，已重试 " +
+                                    "$notFoundAttempts 次且所有镜像均无）: url=${page.url}"
+                        }
+                        break
                     }
-                    break
+                    notFoundAttempts++
+                    val delayMs = IMAGE_NOT_FOUND_RETRY_BASE_MS * notFoundAttempts +
+                            Random.nextLong(IMAGE_AUTO_RETRY_JITTER_MS)
+                    logger.debug {
+                        "第 ${index + 1} 页返回 HTTP $code，${delayMs}ms 后第 " +
+                                "$notFoundAttempts/$IMAGE_NOT_FOUND_RETRY_MAX 次换源重试: url=${page.url}"
+                    }
+                    delay(delayMs)
+                    if (painter.state.value is AsyncImagePainter.State.Success) break
+                    painter.restart()
+                    continue
                 }
+
                 if (attempt >= IMAGE_AUTO_RETRY_MAX) {
                     logger.warn {
                         "第 ${index + 1} 页自动重试已用尽（${httpStatusOf(current.result.throwable) ?: "非 HTTP"}）: url=${page.url}"
