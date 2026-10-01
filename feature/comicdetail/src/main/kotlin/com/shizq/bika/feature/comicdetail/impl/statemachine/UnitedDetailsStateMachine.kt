@@ -11,6 +11,7 @@ import com.shizq.bika.core.network.BikaDataSource
 import com.shizq.bika.core.network.model.ActionData
 import com.shizq.bika.core.network.runCatchingApi
 import com.shizq.bika.feature.comicdetail.impl.ComicDetail
+import com.shizq.bika.feature.comicdetail.impl.ComicSummary
 import com.shizq.bika.feature.comicdetail.impl.UnitedDetailsAction
 import com.shizq.bika.feature.comicdetail.impl.UnitedDetailsUiState
 import com.shizq.bika.feature.comicdetail.impl.toComicDetail
@@ -20,8 +21,6 @@ import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Clock
 
@@ -37,32 +36,20 @@ class UnitedDetailsStateMachine @AssistedInject constructor(
         spec {
             inState<UnitedDetailsUiState.Initialize> {
                 onEnter {
-                    runCatchingApi {
-                        coroutineScope {
-                            val detailDeferred =
-                                async { network.getComicDetails(comicId).toComicDetail() }
-                            val recommendationsDeferred = async {
-                                // 推荐属于详情页下方的附加内容，不能无限期阻塞首屏。
-                                // 服务器慢或暂时不可用时，先展示详情，推荐留空即可。
-                                try {
-                                    withTimeoutOrNull(RECOMMENDATIONS_TIMEOUT_MS) {
-                                        network.getRecommendations(comicId).toComicSummaryList()
-                                    }.orEmpty()
-                                } catch (e: CancellationException) {
-                                    throw e
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "Recommendations unavailable; showing detail without them", e)
-                                    emptyList()
-                                }
-                            }
-                            detailDeferred.await() to recommendationsDeferred.await()
-                        }
-                    }.fold(
-                        onSuccess = { (detail, recommendations) ->
-                            // 历史写入放在这里而不是 Content.onEnterEffect：
-                            // 后者在每次 mutate（点赞/收藏/展开回复）后是否重新触发，
-                            // 取决于 flowredux2 的 re-entry 语义。加载成功恰好发生一次，
-                            // 语义明确且与原先的意图等价。
+                    // 只等详情接口，**不等推荐**。
+                    //
+                    // 曾经这里是 `detailDeferred.await() to recommendationsDeferred.await()`：
+                    // 两个请求并发发出，但状态推进必须等两者都回来。于是推荐慢或超时
+                    // （上限 RECOMMENDATIONS_TIMEOUT_MS）会把整个详情页按在转圈上
+                    // ——详情其实早就到手了。
+                    //
+                    // 现在推荐挪到 Content 之后再补（见下方单独的 inState<Content> 块）：
+                    // 首屏只取决于详情一个请求。
+                    runCatchingApi { network.getComicDetails(comicId).toComicDetail() }.fold(
+                        onSuccess = { detail ->
+                            // 历史写入放在这里而不是 Content 的 onEnter：
+                            // 后者在每次重新进入 Content（例如 Error→Retry→成功）时都会跑，
+                            // 而"加载成功"恰好发生一次，语义明确且与原先的意图等价。
                             historyDao.upsertHistory(detail.toHistoryEntity(comicId))
                             Log.d(
                                 TAG,
@@ -72,7 +59,9 @@ class UnitedDetailsStateMachine @AssistedInject constructor(
                                 UnitedDetailsUiState.Content(
                                     id = comicId,
                                     detail = detail,
-                                    recommendations = recommendations
+                                    // 推荐是页面底部的附加内容，先留空，到了再由
+                                    // Content 的 onEnter 补上。
+                                    recommendations = emptyList(),
                                 )
                             }
                         },
@@ -82,6 +71,26 @@ class UnitedDetailsStateMachine @AssistedInject constructor(
             }
 
             inState<UnitedDetailsUiState.Content> {
+                // 第一屏已经在屏幕上了，推荐晚到多久都不影响它。
+                //
+                // 拿不到就保持空列表：UI 侧本来就是
+                // `if (recommendations.isNotEmpty())` 才渲染这一段，空列表等于不显示，
+                // 不需要额外的"加载中/失败"状态，也不会打断阅读。
+                //
+                // 依赖 flowredux2 的一条语义：在这里 `mutate` 不会重入本 onEnter。
+                // 该语义由 FlowReduxOnEnterReentryTest 钉住（否则会变成无限重发推荐请求）。
+                onEnter {
+                    val recommendations = loadRecommendations()
+                    // 必须显式给出 else 分支：onEnter 的返回值是 ChangedState<…>，
+                    // 只写 `if (...) mutate {}` 会让类型推断成 Unit 而编译不过。
+                    // 拿不到推荐属于正常情况（服务端慢/没有推荐位），noChange() 即可。
+                    if (recommendations.isNotEmpty()) {
+                        mutate { copy(recommendations = recommendations) }
+                    } else {
+                        noChange()
+                    }
+                }
+
                 on<UnitedDetailsAction.ToggleLike> {
                     val currentDetail = snapshot.detail
 
@@ -138,13 +147,39 @@ class UnitedDetailsStateMachine @AssistedInject constructor(
         }
     }
 
+    /**
+     * 拉推荐列表；任何失败/超时都退回空列表。
+     *
+     * 这个值只影响页面底部的推荐位，**不参与首屏判定**，所以：
+     * - 超时可以给得比过去宽松（过去 1.5s 是为了把对首屏的拖累压到最小，
+     *   现在它不拖累任何人，太短反而会让慢一点点的推荐白丢）；
+     * - 失败不上报、不抛给状态机，页面保持"没有推荐"即可。
+     */
+    private suspend fun loadRecommendations(): List<ComicSummary> = try {
+        withTimeoutOrNull(RECOMMENDATIONS_TIMEOUT_MS) {
+            network.getRecommendations(comicId).toComicSummaryList()
+        }.orEmpty()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(TAG, "Recommendations unavailable; detail page stays visible without them", e)
+        emptyList()
+    }
+
     @AssistedFactory
     interface Factory {
         fun create(comicId: String): UnitedDetailsStateMachine
     }
 
     private companion object {
-        private const val RECOMMENDATIONS_TIMEOUT_MS = 1_500L
+        /**
+         * 推荐请求的等待上限。
+         *
+         * 从 1.5s 放宽到 8s：这个上限原先存在的唯一理由是"别把首屏拖住"，
+         * 而推荐已经不再参与首屏判定（见 Content 的 onEnter），
+         * 卡在 1.5s 只会让稍慢的推荐白丢。
+         */
+        private const val RECOMMENDATIONS_TIMEOUT_MS = 8_000L
         const val ACTION_LIKE = ActionData.ACTION_LIKE
         const val ACTION_UNLIKE = ActionData.ACTION_UNLIKE
         const val ACTION_FAVORITE = ActionData.ACTION_FAVORITE

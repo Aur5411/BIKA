@@ -25,10 +25,19 @@ import java.util.concurrent.TimeUnit
  *
  * 于是把两件事提前到 ViewModel 刚起来、还在拉章节表的时候做：
  *
- * 1. **提前选路**：并发探一遍候选源，先把最快的那个记进 [ImageHostRouter]，
- *    第一张图就直接打它，不必再从慢主源起步、熬到 900ms 阈值才触发竞速；
- * 2. **提前握手**：对胜出的源摊好几条连接塞进连接池 idle 5 分钟，用户真正
- *    要图时直接复用。
+ * 1. **提前握手**：对将要使用的源摊好几条连接塞进连接池 idle 5 分钟，
+ *    用户真正要图时直接复用；
+ * 2. **提前选路**：并发探一遍候选源，把最快的那个记进 [ImageHostRouter]。
+ *
+ * ## 这两件事的顺序很重要（v1.11.35 调整）
+ *
+ * 旧实现是"先选路、后建连"：`target = preferredHost() ?: electFastestHost()`。
+ * 冷启动时没有任何结论，于是**必须先等完一轮 7 个候选源的 HEAD 探测**
+ * （单项上限 `RACE_TIMEOUT_MS`）才能开始建连——首图等到的连接是凉的。
+ *
+ * 现在冷启动改为：先用 [ImageHostRouter.startupHostOrNull] 给出的兜底源
+ * **立刻建连**，再在后台补一轮选路。首图既不用等探测，又能拿到热连接；
+ * 选路结论仍然会被记下来供后续图片使用。
  *
  * ## 预热 downloads 的是状态码，不是流量
  *
@@ -55,15 +64,35 @@ class ImageConnectionWarmup @Inject constructor(
      *   就是白占 OkHttp 的同域名请求额度（真正下载要靠那里面的配额）。
      */
     suspend fun warmUp(connections: Int = WARM_CONNECTIONS) {
-        val target = router.preferredHost() ?: electFastestHost()
+        val remembered = router.preferredHost()
+        val target = remembered
+            ?: router.startupHostOrNull()
+            ?: electFastestHost()
         if (target == null) return
-        if (target == warmedHost) return
-        warmedHost = target
 
-        withContext(Dispatchers.IO) {
-            coroutineScope {
-                repeat(connections) { launch { connect(target) } }
+        if (target != warmedHost) {
+            warmedHost = target
+            withContext(Dispatchers.IO) {
+                coroutineScope {
+                    repeat(connections) { launch { connect(target) } }
+                }
             }
+        }
+
+        // 走兜底源打头阵的那一次，仍然要在后台把"谁最快"选出来。
+        //
+        // 兜底源只是"已知可用且容错面最宽"，不等于**当前网络下最快**。
+        // 不选一次的话，[ImageHostRouter] 会一整场会话都没有结论，
+        // 后续每张图都直接用兜底源，失去对网络变化的适应能力。
+        //
+        // 顺序上放在预热之后：这样 7 个候选源的 HEAD 探测不会和首屏图片
+        // 抢同一波带宽与连接。（旧实现是先探测、后建连，首图只能干等探测结束，
+        // 那正是"第一次打开慢"的一部分。）
+        //
+        // `remembered == null` 才选：已经有结论时尊重既有结论；
+        // 结论过期时 preferredHost 也返回 null，同样会走到这里重新选，是预期的。
+        if (remembered == null) {
+            electFastestHost()
         }
     }
 

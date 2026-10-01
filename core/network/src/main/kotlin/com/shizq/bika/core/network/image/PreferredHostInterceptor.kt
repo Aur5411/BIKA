@@ -50,7 +50,15 @@ internal class PreferredHostInterceptor(
         // /static/{path} 在哪个域名下都指向同一张图。
         if (!originalUrl.isChapterImagePath()) return chain.proceed()
 
-        val preferred = router.preferredHost() ?: return chain.proceed()
+        // 优先用竞速选出的最快源；**本进程还没有结论时**退回兜底源
+        // （见 ImageHostRouter.startupHostOrNull）。
+        //
+        // 这一条专门针对"第一次打开特别慢"：冷启动首图的 fileServer 常常是
+        // 连不上的污染节点，原样打过去要等满 SLOW_MAIN_THRESHOLD_MS（900ms）
+        // 才会触发竞速。直接改成打已知可用的兜底源，这 900ms 就省掉了。
+        val preferred = router.preferredHost()
+            ?: router.startupHostOrNull()
+            ?: return chain.proceed()
         if (preferred == originalUrl.host) return chain.proceed()
         // 只会是候选池里的域名（只有竞速/串行胜者才会 remember），
         // 这里再挡一道防御性检查，避免将来有别的写入路径把非法值塞进来。
