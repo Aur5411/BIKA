@@ -27,6 +27,20 @@ data class Media(
         get() = buildStaticUrl(fileServer, path)
 
     /**
+     * 与 [safeImageUrl] **相同的归一化**，但永不返回 null。
+     *
+     * 供下载链路使用。下载的语义是"尽力去抓"：即使字段缺失也要保留一个值，
+     * 这样失败时能报出服务端真实给的地址，而不是静默丢弃这一项——
+     * 静默丢弃会让分页循环把"这一页全畸形"误判成"没有更多页"而提前终止，
+     * 反而丢掉后面本来正常的页。
+     *
+     * （原先下载用的是 [originalImageUrl]，完全不做归一化，
+     * 于是同一批含空白路径的图在阅读时能修好、在离线下载时却必然失败。）
+     */
+    val normalizedImageUrl: String
+        get() = buildStaticUrl(fileServer, path) ?: originalImageUrl
+
+    /**
      * 拼接 `{fileServer}/static/{path}`，并在若干已知会产出**必然 404** 的形态上
      * 做归一化/拒绝。
      *
@@ -81,12 +95,48 @@ data class Media(
             // 服务端若已带 static/ 前缀，剥掉，避免 /static/static/ 这种必然 404 的地址
             .removePrefix("static/")
             .trimStart('/')
-            // 路径段内的空格是脏数据，真实字符为下划线。
-            // 放行的话 OkHttp 会编码成 %20 发出去，CDN 侧确定性 403，
+            // 路径段内的空白是脏数据，真实字符为下划线（见上方专节）。
+            // 放行的话 OkHttp 会把它编码成 %20 / %C2%A0 发出去，CDN 侧确定性 403，
             // 且因为 URL"看起来完全正常"，排查时会误判成"图不存在"。
-            .replace(" ", "_")
+            .normalizePathBlanks()
 
         if (cleaned.isEmpty()) return null
         return "${server.trimEnd('/')}/static/$cleaned"
+    }
+}
+
+/**
+ * 把路径里"看起来是空格"的字符统一还原为下划线。
+ *
+ * ## 为什么逐一列出而不用 `Char.isWhitespace()`
+ *
+ * `\u00A0`（不间断空格）在 Java 的 `Character.isWhitespace()` 里返回 **false**，
+ * 但它渲染出来和普通空格**完全一样**——正是这类脏值最容易漏掉的一种。
+ * 只写 `.replace(" ", "_")` 会在这上面栽跟头，而且现象与没修一模一样。
+ *
+ * ## 为什么统一还原是安全的
+ *
+ * 实测（同一张图、同一目录段，4 个边缘 IP 交叉验证）：
+ *
+ * | 目录段 | 状态 |
+ * |---|---|
+ * | `sub_storage 1`（U+0020） | 403 |
+ * | `sub_storage\u00A01`（U+00A0） | 403 |
+ * | `sub_storage　1`（U+3000） | 403 |
+ * | `sub_storage\t1`（U+0009） | 403 |
+ * | `sub_storage_1`（下划线） | **200** |
+ *
+ * 所有空白变体都取不到图，只有下划线是正确字符，因此不存在"误伤合法路径"的风险。
+ */
+private val PATH_BLANK_CHARS = charArrayOf(
+    ' ',      // U+0020 普通空格
+    '\u00A0', // U+00A0 不间断空格（NBSP）
+    '\u3000', // U+3000 全角空格
+    '\t',     // U+0009 制表符
+)
+
+private fun String.normalizePathBlanks(): String = buildString(length) {
+    for (c in this@normalizePathBlanks) {
+        append(if (c in PATH_BLANK_CHARS) '_' else c)
     }
 }

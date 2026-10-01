@@ -163,4 +163,85 @@ class MediaUrlTest {
             media.safeImageUrl,
         )
     }
+
+    // ---- 下列用例锁定"看起来是空格、但不是普通空格"的字符 ----
+    //
+    // Java 的 Character.isWhitespace('\u00A0') 返回 **false**，但它渲染出来和普通
+    // 空格完全一样。只写 .replace(" ", "_") 会在这些字符上**静默失效**，
+    // 现象与完全没修一模一样——这是本类要防住的最后一种漏网形态。
+    //
+    // 实测（storage-b，同一张图）：U+0020 / U+00A0 / U+3000 / U+0009 全部 403，
+    // 只有下划线返回 200。所以统一还原是安全的，不存在误伤合法路径的风险。
+
+    @Test
+    fun `不间断空格同样被还原为下划线`() {
+        val media = Media(
+            path = "sub_storage\u00A01/6a/7c/1.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        assertEquals(
+            "https://storage-b.picacomic.com/static/sub_storage_1/6a/7c/1.jpg",
+            media.safeImageUrl,
+        )
+    }
+
+    @Test
+    fun `全角空格同样被还原为下划线`() {
+        val media = Media(
+            path = "sub_storage\u30001/6a/7c/1.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        assertEquals(
+            "https://storage-b.picacomic.com/static/sub_storage_1/6a/7c/1.jpg",
+            media.safeImageUrl,
+        )
+    }
+
+    @Test
+    fun `制表符同样被还原为下划线`() {
+        val media = Media(
+            path = "sub_storage\t1/6a/7c/1.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        assertEquals(
+            "https://storage-b.picacomic.com/static/sub_storage_1/6a/7c/1.jpg",
+            media.safeImageUrl,
+        )
+    }
+
+    @Test
+    fun `归一化后不残留任何空白字符`() {
+        val media = Media(
+            path = "sub_storage\u00A01/6a/7c/1.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        val url = media.safeImageUrl!!
+        val hasBlank = url.any { it == ' ' || it == '\u00A0' || it == '\u3000' || it == '\t' }
+        assert(!hasBlank) { "URL 中不应残留空白字符: $url" }
+    }
+
+    // ---- normalizedImageUrl：下载链路专用的"永不返回 null"入口 ----
+
+    @Test
+    fun `normalizedImageUrl 与 safeImageUrl 的归一化结果一致`() {
+        val media = Media(
+            path = "sub_storage 1/6a/7c/1.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        assertEquals(media.safeImageUrl, media.normalizedImageUrl)
+        assertEquals(
+            "https://storage-b.picacomic.com/static/sub_storage_1/6a/7c/1.jpg",
+            media.normalizedImageUrl,
+        )
+    }
+
+    @Test
+    fun `normalizedImageUrl 在字段缺失时回退原值而不为 null`() {
+        // 下载链路必须拿到一个值：静默丢弃会让分页循环把"这一页全畸形"
+        // 误判成"没有更多页"而提前终止，反而丢掉后面正常的页。
+        val media = Media(path = "abc/1.jpg", fileServer = "")
+        assertNull(media.safeImageUrl)
+        assertEquals(media.originalImageUrl, media.normalizedImageUrl)
+        assert(media.normalizedImageUrl.isNotEmpty())
+    }
 }

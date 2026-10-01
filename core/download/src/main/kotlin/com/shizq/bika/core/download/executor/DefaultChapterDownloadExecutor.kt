@@ -206,7 +206,11 @@ class DefaultChapterDownloadExecutor @Inject constructor(
 
             val pagination = response.imagePages
             val images = pagination.docs
-                .mapNotNull { it.media.originalImageUrl.takeIf(String::isNotEmpty) }
+                // 用 normalizedImageUrl 而不是 originalImageUrl：后者不做任何归一化，
+                // 服务端 path 里混入的空白（如 `sub_storage 1`）会原样带进请求，
+                // 在 CDN 上确定性 403。在线阅读走的是 safeImageUrl（已归一化），
+                // 两边不一致会导致"能看不能下"这种极难排查的现象。
+                .mapNotNull { it.media.normalizedImageUrl.takeIf(String::isNotEmpty) }
 
             allPages.addAll(images)
 
