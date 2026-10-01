@@ -220,6 +220,97 @@ class MediaUrlTest {
         assert(!hasBlank) { "URL 中不应残留空白字符: $url" }
     }
 
+    // ---- 归一化改为「按 Unicode 类别一刀切」后的回归 ----
+    //
+    // 上一版是逐个枚举字符，属于"发现一种、补一种"。现在按 Unicode 类别判定：
+    // Cc（控制）/ Cf（格式）/ Zs（空格分隔）/ Zl（行分隔）/ Zp（段分隔）五类
+    // 一律视为不可见垃圾。
+    //
+    // 为什么"取并集"也不够——最顺手的那两个判据**互有盲区**：
+    //   Character.isWhitespace('\u00A0') == false   ← NBSP 漏
+    //   Character.isWhitespace('\u202F') == false   ← 窄 NBSP 漏
+    //   Character.isSpaceChar('\u2028')  == false   ← 行分隔符漏（非 Zs）
+    //   两者都判不出 '\u200B' / '\uFEFF' / '\u180E'  ← 全是 Cf 类别
+    //
+    // 这些字符渲染后与普通空格完全无异，只能靠码位区分。
+
+    @Test
+    fun `五类不可见字符全谱都被还原为下划线`() {
+        val blanks = listOf(
+            '\u0020', // Zs  SPACE
+            '\u00A0', // Zs  NO-BREAK SPACE        ← isWhitespace() 判 false
+            '\u1680', // Zs  OGHAM SPACE MARK
+            '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', // Zs EN QUAD …
+            '\u2005', '\u2006', '\u2007', '\u2008', '\u2009', '\u200A', // Zs … HAIR SPACE
+            '\u202F', // Zs  NARROW NO-BREAK SPACE ← isWhitespace() 判 false
+            '\u205F', // Zs  MEDIUM MATHEMATICAL SPACE
+            '\u3000', // Zs  IDEOGRAPHIC SPACE（全角空格）
+            '\u2028', // Zl  LINE SEPARATOR       ← isSpaceChar() 判 false
+            '\u2029', // Zp  PARAGRAPH SEPARATOR
+            '\u0009', '\u000B', '\u000C', '\u000D', // Cc 制表 / 垂直制表 / 换页 / 回车
+            '\u001C', '\u001F', // Cc 文件/组/记录/单元分隔符（isWhitespace 认，类别也认）
+            '\u0085', // Cc  NEL（下一行）
+            '\u200B', '\u200C', '\u200D', '\u200E', '\u200F', // Cf 零宽字符
+            '\u2060', // Cf  词连接符
+            '\uFEFF', // Cf  零宽不换行空格（BOM）
+            '\u180E', // Cf  蒙古文元音分隔符 ← 两个常用判据**都判不出**，类别法才兜得住
+            '\u00AD', // Cf  软连字符
+        )
+        blanks.forEach { blank ->
+            val media = Media(
+                path = "sub_storage${blank}1/6a/7c/1.jpg",
+                fileServer = "https://storage-b.picacomic.com",
+            )
+            val code = blank.code.toString(16).uppercase().padStart(4, '0')
+            assertEquals(
+                "https://storage-b.picacomic.com/static/sub_storage_1/6a/7c/1.jpg",
+                media.safeImageUrl,
+                "字符 U+$code（类别 ${Character.getType(blank)}）未被还原为下划线",
+            )
+        }
+    }
+
+    @Test
+    fun `可打印字符一律保留不被误伤`() {
+        // 反向保护：归一化只处理"不可见"的，对任何可打印字符都必须原样保留，
+        // 否则会把本来正常的路径改坏——那是比 404 更难查的故障。
+        val media = Media(
+            path = "sub_storage_1/6a/7c/1.jpg?x=1&y=~%2F",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        assertEquals(
+            "https://storage-b.picacomic.com/static/sub_storage_1/6a/7c/1.jpg?x=1&y=~%2F",
+            media.safeImageUrl,
+        )
+    }
+
+    @Test
+    fun `字段首尾是不可见字符时也能被裁掉而不是变成下划线`() {
+        // 回归保护：朴素 String.trim() 内部走 Char.isWhitespace()，**判不出 U+00A0**。
+        // 若这里漏掉，NBSP 不会被裁掉，紧接着归一化会把它替换成下划线，拼出
+        // `_sub_storage/...` 这种同样 403 的地址——错得比完全不修更隐蔽。
+        val media = Media(
+            path = "\u00A0sub_storage 1/1.jpg\u00A0",
+            fileServer = "\u00A0https://storage-b.picacomic.com\u00A0",
+        )
+        assertEquals(
+            "https://storage-b.picacomic.com/static/sub_storage_1/1.jpg",
+            media.safeImageUrl,
+        )
+    }
+
+    @Test
+    fun `归一化后不残留任何不可见字符`() {
+        val media = Media(
+            path = "sub_storage\u00A01/6a\u200B/7c/1\uFEFF.jpg",
+            fileServer = "https://storage-b.picacomic.com",
+        )
+        val url = media.safeImageUrl!!
+        // 断言用的是一份"手写的坏字符清单"，不复用生产代码的判据，避免自己验自己
+        val junk = url.filter { it in UNPRINTABLE_CHARS }
+        assert(junk.isEmpty()) { "URL 中不应残留不可见字符，实际残留: $junk（$url）" }
+    }
+
     // ---- normalizedImageUrl：下载链路专用的"永不返回 null"入口 ----
 
     @Test
@@ -243,5 +334,21 @@ class MediaUrlTest {
         assertNull(media.safeImageUrl)
         assertEquals(media.originalImageUrl, media.normalizedImageUrl)
         assert(media.normalizedImageUrl.isNotEmpty())
+    }
+
+    private companion object {
+        /**
+         * 断言用的坏字符清单，**手写**，刻意不复用生产代码的判据——
+         * 否则"自己验自己"，生产判据漏掉的字符在测试里也会一起漏掉。
+         */
+        val UNPRINTABLE_CHARS: Set<Char> = setOf(
+            '\u0000', '\u0009', '\u000A', '\u000B', '\u000C', '\u000D',
+            '\u001C', '\u001F', '\u0020', '\u007F', '\u0085', '\u009F',
+            '\u00A0', '\u00AD', '\u1680', '\u180E',
+            '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005',
+            '\u2006', '\u2007', '\u2008', '\u2009', '\u200A', '\u200B',
+            '\u200C', '\u200D', '\u200E', '\u200F',
+            '\u2028', '\u2029', '\u202F', '\u205F', '\u2060', '\u3000', '\uFEFF',
+        )
     }
 }

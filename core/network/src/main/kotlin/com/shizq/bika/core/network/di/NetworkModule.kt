@@ -19,6 +19,7 @@ import com.shizq.bika.core.network.dns.appChannelHeaderFor
 import com.shizq.bika.core.network.image.ImageHostHealth
 import com.shizq.bika.core.network.image.ImageHostRouter
 import com.shizq.bika.core.network.image.ImageRateGovernor
+import com.shizq.bika.core.network.image.ImagePathGuardInterceptor
 import com.shizq.bika.core.network.image.ImageThrottleInterceptor
 import com.shizq.bika.core.network.image.PreferredHostInterceptor
 import com.shizq.bika.core.network.plugin.ApiEnvelopePlugin
@@ -419,8 +420,14 @@ internal object NetworkModule {
                     callFactory = { okHttpClient },
                     concurrentRequestStrategy = { ImageDownloadCoordinator() },
                 ))
-                // 顺序即执行顺序：最外层先过节流闸门（它能看到整条链路的最终成败，
-                // 负责退避重试），再把请求改写到已知最快的源，最后才走降级竞速。
+                // 顺序即执行顺序：先给 URL 治好路径（地址错了换多少源都没用），
+                // 再过节流闸门（它能看到整条链路的最终成败，负责退避重试），
+                // 再把请求改写到已知最快的源，最后才走降级竞速。
+                //
+                // 路径守卫放最前面还有一个实际好处：它的日志打在链路入口，
+                // 后续所有层看到的都是修好的 URL——不会出现"日志里明明是干净的
+                // 地址、却依然 404"这种自相矛盾的现场。
+                add(ImagePathGuardInterceptor())
                 add(ImageThrottleInterceptor(governor))
                 add(PreferredHostInterceptor(hostRouter))
                 add(DomainFallbackInterceptor(hostRouter, governor, hostHealth))
