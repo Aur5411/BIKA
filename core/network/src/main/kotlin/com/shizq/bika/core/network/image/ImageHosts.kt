@@ -28,6 +28,31 @@ package com.shizq.bika.core.network.image
  * 只有 `/static/` 下能返回 200/301 的才入池。仅凭"域名里带 storage/img、
  * 能 ping 通"就加进来，等于给每一次换源都加一次必败请求。
  *
+ * ## 路径里的 `tobs/` 是**后端选择段**，不是普通目录
+ *
+ * 这一条决定了"换源能不能救回一张图"，是最容易被误判的一层。
+ *
+ * 实测（本机直连，路径 `sub_storage_1/7f/8b/<真实 uuid>.jpg`，683 KB 级大图）：
+ *
+ * | 域名 | `/static/tobs/sub_storage_1/…` | `/static/sub_storage_1/…`（无 `tobs/`） |
+ * |---|---|---|
+ * | `storage.diwodiwo.xyz` | 301 → `storage-b.diwodiwo.xyz/static/sub_storage_1/…` → **200** | **404** |
+ * | `storage.tipatipa.xyz` | 301 → 同上 → **200** | **404** |
+ * | `storage-b.diwodiwo.xyz` | 301（自我剥掉 `tobs/`）→ **200** | **200** |
+ *
+ * 也就是说 `tobs/` 的含义是"这份文件在 storage-b 后端"，靠它做后端路由；
+ * **一旦 URL 里没有 `tobs/`，池子里那些"路由器"域名全部 404**。
+ *
+ * 为什么这条很致命：[DomainFallbackInterceptor] 换源时**只改 host、保留 path**。
+ * 若服务端给的 `path` 恰好不带 `tobs/` 前缀，那么无论换到池子里哪一个路由器域名，
+ * 拿到的都是 404 —— 遍历一圈全灭，最后被判定成"服务端缺图"，
+ * 界面报 **"图片不存在（HTTP 404）"**，而这张图其实好好地躺在源站上。
+ * 这正是"某几页怎么重试都出不来"在 `sub_storage*` 分桶目录上的成因。
+ *
+ * 所以池子里必须至少保留一个**能直接吃下无 `tobs/` 路径**的节点。
+ * `storage-b.diwodiwo.xyz` 就是这样的节点：上表 8 种路径形态（有/无 `tobs/` ×
+ * 3 个真实 uuid + 1 个普通图）**全部 200**，是当前容错面最宽的候选，故排首位。
+ *
  * ## 顺序的含义
  *
  * - 竞速（race）是并发的，顺序只决定同速时的胜出者；
@@ -44,6 +69,10 @@ internal object ImageHosts {
 
     /** 主源（API 返回的 `fileServer`）之外的全部候选镜像。 */
     val imageDomains = listOf(
+        // 容错面最宽：有/无 `tobs/` 前缀都能直接 200（本身就在 storage-b 后端上），
+        // 无需跳转。换源只改 host 不改 path，所以它必须排第一——
+        // 它是池子里唯一能接住"path 不带 tobs/"的节点。
+        "https://storage-b.diwodiwo.xyz",
         "https://s3.picacomic.com",
         "https://s2.picacomic.com",
         "https://storage1.picacomic.com",
@@ -66,6 +95,10 @@ internal object ImageHosts {
      * 叠加带宽（16 并发约 3 MB/s），而 diwodiwo 是唯一始终可达且最快的节点。
      * 预热猜错了没有代价——坏连接闲置 5 分钟会被连接池清掉，
      * 真正下载时的选路结论仍然来自竞速。
+     *
+     * 选 `storage-b.diwodiwo.xyz` 而不是 `storage.diwodiwo.xyz`：前者就在
+     * storage-b 后端上，`/static/{path}` 直接 200，**省掉一次跨域 `301`**；
+     * 后者是只做后端路由的前端，任何请求都要先跳一次。
      */
-    const val DEFAULT_HOST = "storage.diwodiwo.xyz"
+    const val DEFAULT_HOST = "storage-b.diwodiwo.xyz"
 }

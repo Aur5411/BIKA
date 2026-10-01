@@ -52,6 +52,7 @@ class ImageHostsTest {
         // 全部 200；img / www 全部 404。
         assertEquals(
             listOf(
+                "storage-b.diwodiwo.xyz",
                 "s3.picacomic.com",
                 "s2.picacomic.com",
                 "storage1.picacomic.com",
@@ -60,6 +61,30 @@ class ImageHostsTest {
                 "storage.tipatipa.xyz",
             ),
             ImageHosts.imageHosts,
+        )
+    }
+
+    /**
+     * 池子里必须至少有一个**能接住不带 `tobs/` 前缀的路径**的节点，且排首位。
+     *
+     * 依据：`tobs/` 是后端选择段。池中 `storage.diwodiwo.xyz` /
+     * `storage.tipatipa.xyz` 这类"路由器"只有在路径带 `tobs/` 时才 301 到
+     * storage-b 后端；路径不带 `tobs/` 时它们一律 **404**。
+     *
+     * 而换源只改 host、不改 path。若服务端给的 `path` 不带 `tobs/`，
+     * 全池遍历会集体 404，被误判成"服务端缺图"——界面报
+     * "图片不存在（HTTP 404）"，实际那张图在源站上完好。
+     *
+     * `storage-b.diwodiwo.xyz` 实测对 8 种路径形态（有/无 `tobs/` ×
+     * 3 个真实 uuid + 1 个普通图）全部 200，是唯一能兜住这种情况的候选，
+     * 因此它必须排在最前——串行兜底的顺序即尝试次序，放队尾等于白放。
+     */
+    @Test
+    fun `能接住无 tobs 前缀路径的真源站排在首位`() {
+        assertEquals(
+            "storage-b.diwodiwo.xyz",
+            ImageHosts.imageHosts.first(),
+            "换源不改 path，能兜住无 tobs 前缀路径的节点必须在串行兜底里第一个被尝试",
         )
     }
 

@@ -9,13 +9,14 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * ## 为什么必须有它
  *
- * 候选池 [ImageHosts] 有 8 个域名，但本机实测（`curl` 直连 + 代理双路验证）
- * **只有 2 个在当前的国内网络环境里真的能取到图**：
+ * 候选池 [ImageHosts] 有 7 个域名，但本机实测（`curl` 直连 + 代理双路验证）
+ * **只有 3 个在当前的国内网络环境里真的能取到图**：
  *
  * | 域名 | 结果 |
  * |---|---|
- * | `s3` / `s2` / `storage1` / `img` / `www` / `storage-b`.picacomic.com | **000 完全不可达**（DNS 被污染，解析到虚假 `2001::` 地址） |
- * | `storage.diwodiwo.xyz` | 200 + 完整字节 |
+ * | `s3` / `s2` / `storage1` / `storage-b`.picacomic.com | **000 完全不可达**（DNS 被污染，解析到虚假 `2001::` 地址） |
+ * | `storage-b.diwodiwo.xyz` | 200 + 完整字节（真实源站，无需跳转） |
+ * | `storage.diwodiwo.xyz` | 200 + 完整字节（需经 301 跳转） |
  * | `storage.tipatipa.xyz` | 200 + 完整字节 |
  *
  * 而 API 下发的 `fileServer` 恰恰常常是 `storage1.picacomic.com` 这个**不可达**的源。
