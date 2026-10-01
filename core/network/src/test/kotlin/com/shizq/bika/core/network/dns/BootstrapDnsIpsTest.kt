@@ -19,8 +19,27 @@ import kotlin.test.assertTrue
  * 也就是说图与 URL 都没问题，唯一致命因素是解析。因此"启动早期必须有非空兜底 IP"
  * 这条不变量必须被测试守住——它一旦被改回 `emptyList()`，整个故障会原样复现，
  * 且因为失败页码随预载节奏漂移，非常难再次定位。
+ *
+ * ## 第二条不变量：不能收录"对 storage-b 返回 403"的 IP
+ *
+ * 服务端会把 `/static/tobs/xxx.jpg` 在任意域名下 `301` 重定向到
+ * `storage-b.picacomic.com`，而 `storage-b` 的可用性按 CF 边缘节点（IP）分裂。
+ * OkHttp 只在**连接失败**时才换 IP，**403 不触发切换**，所以列表里排最前的
+ * 那个 IP 一旦对 `storage-b` 是 403，图片就确定性失败、重试无效。
+ * 这条属于"数据正确性"，无法靠单测的静态断言完全覆盖（需要联网），
+ * 因此在 [BootstrapDnsIps] 的 KDoc 里记录了完整的实测矩阵；
+ * 这里只守结构与规模。
  */
 class BootstrapDnsIpsTest {
+
+    /** 已知对 `storage-b.picacomic.com` 返回 403 的 IP，绝不能进兜底池。 */
+    private val storageBHostileIps = setOf(
+        "104.21.20.188",
+        "104.20.33.201",
+        "104.25.248.203",
+        "172.66.168.88",
+        "172.66.208.43",
+    )
 
     @Test
     fun `兜底 IP 列表非空`() {
@@ -54,13 +73,39 @@ class BootstrapDnsIpsTest {
     @Test
     fun `兜底 IP 覆盖多个不同网段`() {
         // 全部落在同一 /16 时，一次路由抖动就会同时失效；
-        // 实测可用的 CF 段横跨 104.16 / 104.17 / 104.20 / 104.25
+        // 实测可用的 CF 段横跨 104.16 / 104.17 / 104.19
         val subnets = BootstrapDnsIps.BOOTSTRAP_IP_STRINGS
             .map { it.substringBeforeLast('.') }
             .toSet()
         assertTrue(
             subnets.size >= 2,
             "兜底 IP 只覆盖 $subnets 一个网段，单点故障风险过高",
+        )
+    }
+
+    @Test
+    fun `兜底池不得包含对 storage-b 返回 403 的 IP`() {
+        // 见类 KDoc：服务端会 301 到 storage-b，而 OkHttp 不会因 403 换 IP，
+        // 所以这类 IP 排在最前会造成"某些图稳定失败、重试无效"。
+        val offending = BootstrapDnsIps.BOOTSTRAP_IP_STRINGS
+            .filter { it in storageBHostileIps }
+        assertTrue(
+            offending.isEmpty(),
+            "兜底池里混入了对 storage-b 返回 403 的 IP: $offending —— " +
+                    "服务端会 301 重定向到 storage-b，这类 IP 排在最前会导致图片确定性失败",
+        )
+    }
+
+    @Test
+    fun `模型层默认 IP 池与网络层兜底池保持一致方向`() {
+        // 两处各有一份（模块依赖决定无法共用），最容易出现的漂移是
+        // "改了 core:network 忘了改 core:model"。
+        // 这里只要求两者都不含 storage-b 敌对 IP，避免任一处先被改坏。
+        val modelDefaults = com.shizq.bika.core.model.preferences.DnsPreferences.DEFAULT_DNS_IPS
+        val offending = modelDefaults.filter { it in storageBHostileIps }
+        assertTrue(
+            offending.isEmpty(),
+            "DnsPreferences.DEFAULT_DNS_IPS 含 storage-b 敌对 IP: $offending",
         )
     }
 }

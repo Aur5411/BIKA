@@ -66,6 +66,13 @@ class DirectDns @Inject constructor(
     private val apiIpsRef = AtomicReference(BootstrapDnsIps.DEFAULT_IPS)
     private val imageIpsRef = AtomicReference(BootstrapDnsIps.DEFAULT_IPS)
 
+    /**
+     * [rotate] 用的自增计数。用 [java.util.concurrent.atomic.AtomicInteger] 而非
+     * `kotlin.concurrent.atomics` 的那个：这里只需要一个普通的原子自增，
+     * 且要能在 `lookup()`（可能被 OkHttp 的多条线程并发调用）里安全使用。
+     */
+    private val rotationCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
     init {
         scope.launch(Dispatchers.IO) {
             userPreferencesDataSource.userData
@@ -109,18 +116,61 @@ class DirectDns @Inject constructor(
         }
     }
 
+    /**
+     * 每次解析把 IP 列表**轮转一位**再返回，让同一批 IP 被均匀摊到不同连接上。
+     *
+     * ## 为什么必须轮转
+     *
+     * 这是本轮修复"18-20 页 / `storage-b` 404"的关键一层。
+     *
+     * 服务端会做**跨子域重定向**：`/static/tobs/xxx.jpg` 在任意域名下都返回
+     * `301`，`Location` 指向 `storage-b.picacomic.com/static/xxx.jpg`。
+     * 而 `storage-b` 的可用性是**按 Cloudflare 边缘节点（即按 IP）分裂的**，
+     * 实测（同一张图）：
+     *
+     * | IP | `storage1` | `storage-b` |
+     * |---|---|---|
+     * | `104.16.253.195` | 200 | **200** |
+     * | `104.17.227.96` | 200 | **200** |
+     * | `104.20.33.201` | 200 | 403 |
+     * | `104.21.20.188` | 200 | 403 |
+     *
+     * 致命之处在于：**OkHttp 对返回的 IP 列表是顺序尝试，且只在连接层失败
+     * （超时/拒绝/DNS）时才换下一个。403 是一个有效的 HTTP 响应，不会触发换 IP。**
+     * 于是只要列表里排在最前的那个 IP 恰好对 `storage-b` 返回 403，这张图就
+     * **确定性失败**，重试也没用——因为每次解析拿到的顺序都一样。
+     *
+     * 轮转把"固定踩同一个坏节点"变成"多次尝试里总会轮到好节点"：
+     * 同一张图重试、以及不同图之间都会自然散布到池子里所有 IP 上。
+     *
+     * ## 为什么不直接在应用层重试 403
+     *
+     * 403 的语义在图片链路里不唯一（可能是防盗链、也可能是节点没有该文件），
+     * 在拦截器里把它一律当成"该换 IP"会把真正无权限的图也重试一遍、
+     * 浪费配额。在 DNS 层轮转则对所有失败类型都成立，且不改变任何语义判断。
+     *
+     * 用 [java.util.concurrent.atomic.AtomicInteger] 计数而非随机数：
+     * 保证在池子大小次调用内**一定**轮到每个 IP，随机数可能连续几次抽到同一个。
+     */
+    private fun rotate(ips: List<InetAddress>): List<InetAddress> {
+        if (ips.size <= 1) return ips
+        val offset = rotationCounter.getAndIncrement() % ips.size
+        if (offset == 0) return ips
+        return ips.subList(offset, ips.size) + ips.subList(0, offset)
+    }
+
     override fun lookup(hostname: String): List<InetAddress> {
         if (isApiHost(hostname)) {
             val currentApiIps = apiIpsRef.load()
             if (currentApiIps.isNotEmpty()) {
                 logger.debug { "Returning API IP list for hostname: $hostname" }
-                return currentApiIps
+                return rotate(currentApiIps)
             }
         } else if (isImageHost(hostname)) {
             val currentImageIps = imageIpsRef.load()
             if (currentImageIps.isNotEmpty()) {
                 logger.debug { "Returning Image IP list for hostname: $hostname" }
-                return currentImageIps
+                return rotate(currentImageIps)
             }
         }
 

@@ -181,24 +181,24 @@ class DnsAutoSelector @Inject internal constructor(
     /**
      * 出厂兜底候选。
      *
-     * 不再只用单个 [DnsPreferences.DEFAULT_DNS_IP]，而是把整个
-     * [BootstrapDnsIps] 池都放进来。理由：兜底候选是"线路接口与历史快照都拿不到
-     * IP 时"唯一还能指望的东西（典型是首次冷启动、或 DNS 服务暂时不可用），
-     * 只给一个 IP 时它一旦在当前网络不可达，整轮优选就全军覆没、直接放弃写入，
-     * 用户只能一直用那个坏 IP。给一组则只要有一个通，本轮优选就能正常收敛。
+     * 把整个 [BootstrapDnsIps] 池放进来（**不再包含历史默认
+     * [DnsPreferences.DEFAULT_DNS_IP]**）。理由：
+     *
+     * 1. 兜底候选是"线路接口与历史快照都拿不到 IP 时"唯一还能指望的东西
+     *    （典型是首次冷启动、或 DNS 服务暂时不可用），只给一个 IP 时它一旦
+     *    在当前网络不可达，整轮优选就全军覆没、直接放弃写入。
+     * 2. `DEFAULT_DNS_IP`（`104.21.20.188`）实测对 `storage-b.picacomic.com`
+     *    返回 403——而服务端会把 `/static/tobs/xxx.jpg` 301 重定向到该子域，
+     *    所以它一旦胜出，走重定向的图会稳定失败。把它排除在候选外，
+     *    否则本轮优选反而会把一个坏 IP 选出来写进配置。
      */
-    private fun factoryFallbackHosts(): List<ResolvedDnsHost> {
-        val ips = BootstrapDnsIps.BOOTSTRAP_IP_STRINGS
-        val preferred = DnsPreferences.DEFAULT_DNS_IP
-        // 把历史默认 IP 放最前面：它在多数环境下已被验证可用，让它优先参与竞速。
-        val ordered = (listOf(preferred) + ips).distinct()
-        return ordered.flatMap { ip ->
+    private fun factoryFallbackHosts(): List<ResolvedDnsHost> =
+        BootstrapDnsIps.BOOTSTRAP_IP_STRINGS.flatMap { ip ->
             listOf(
                 ResolvedDnsHost(ip, DnsPreferences.DEFAULT_DNS_LINE, BikaDnsDomains.API),
                 ResolvedDnsHost(ip, DnsPreferences.DEFAULT_DNS_LINE, BikaDnsDomains.IMAGE),
             )
         }
-    }
 }
 
 private fun DnsPreferences.asResolvedHosts(): List<ResolvedDnsHost> =
