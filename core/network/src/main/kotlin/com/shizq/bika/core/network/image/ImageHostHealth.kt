@@ -101,6 +101,27 @@ class ImageHostHealth @Inject constructor() {
         nowMs: Long = System.currentTimeMillis(),
     ): List<String> = hosts.sortedBy { if (isQuarantined(it, nowMs)) 1 else 0 }
 
+    /**
+     * 把候选域名拆成「健康」与「已隔离」两组，[first] 为健康、[second] 为已隔离。
+     *
+     * ## 为什么需要"拆分"而不是"排序"
+     *
+     * 并发竞速时，排序**解决不了问题**：竞速会把列表里的每个域名都同时发起，
+     * 被排在后面的死源照样会占住并发名额整整一个 `connectTimeout`（3 秒）。
+     * 一屏十几张图 × 7 个候选 = 上百条竞速连接，而额度只有十几个 ——
+     * 死源把额度吃干，真正可能成功的源反而排不上队。
+     *
+     * 所以竞速必须**只对健康域名发起**；已隔离的域名改为「健康域名全灭后
+     * 再串行试一遍」的最后兜底。这样既消除了死源对额度的稀释，
+     * 又保住了"服务端换节点后新域名仍能被取到"这一条。
+     *
+     * 组内保持传入顺序，让调用方的经验排序继续生效。
+     */
+    fun partitionByHealth(
+        hosts: List<String>,
+        nowMs: Long = System.currentTimeMillis(),
+    ): Pair<List<String>, List<String>> = hosts.partition { !isQuarantined(it, nowMs) }
+
     /** 供测试与日志：当前被隔离的域名集合。 */
     fun quarantinedHosts(nowMs: Long = System.currentTimeMillis()): Set<String> =
         quarantinedUntilMs.keys.filter { isQuarantined(it, nowMs) }.toSet()

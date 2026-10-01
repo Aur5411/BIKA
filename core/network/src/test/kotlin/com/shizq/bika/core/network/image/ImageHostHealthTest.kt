@@ -118,4 +118,46 @@ class ImageHostHealthTest {
 
         assertEquals(setOf("s3.picacomic.com"), health.quarantinedHosts(now))
     }
+
+    @Test
+    fun `拆分成健康组与隔离组`() {
+        val health = ImageHostHealth()
+        val dead = listOf("s3.picacomic.com", "storage1.picacomic.com")
+        dead.forEach { host -> repeat(2) { health.noteUnreachable(host, now) } }
+
+        val candidates = dead + listOf("storage.diwodiwo.xyz", "storage.tipatipa.xyz")
+        val (healthy, quarantined) = health.partitionByHealth(candidates, now)
+
+        assertEquals(
+            listOf("storage.diwodiwo.xyz", "storage.tipatipa.xyz"),
+            healthy,
+            "健康组只含可达域名——并发竞速只对它发起，避免死源稀释额度",
+        )
+        assertEquals(
+            dead,
+            quarantined,
+            "隔离组保留死源，作为健康组全灭后的串行兜底（服务端换节点后仍能试到）",
+        )
+    }
+
+    @Test
+    fun `无隔离时全部归入健康组`() {
+        val health = ImageHostHealth()
+        val hosts = listOf("a.com", "b.com")
+        val (healthy, quarantined) = health.partitionByHealth(hosts, now)
+
+        assertEquals(hosts, healthy)
+        assertTrue(quarantined.isEmpty())
+    }
+
+    @Test
+    fun `隔离到期后重新归入健康组`() {
+        val health = ImageHostHealth()
+        repeat(2) { health.noteUnreachable("s3.picacomic.com", now) }
+        val later = now + 3 * 60 * 1000L + 1
+
+        val (healthy, quarantined) = health.partitionByHealth(listOf("s3.picacomic.com"), later)
+        assertEquals(listOf("s3.picacomic.com"), healthy)
+        assertTrue(quarantined.isEmpty())
+    }
 }

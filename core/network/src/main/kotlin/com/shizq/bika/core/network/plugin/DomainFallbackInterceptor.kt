@@ -166,23 +166,33 @@ class DomainFallbackInterceptor(
      * 它**不再被并发竞速占用**（见 [raceSlots]）——原实现里竞速为每个候选域名
      * 各起一个协程、各自 `withPermit`，一次竞速就能吃掉 7 个名额，同屏两张图
      * 同时竞速即超过 12，后续图片全部阻塞在 `withPermit` 上饿死。
-     * 这正是"第 19 页修好、第 37/38 页又失败"的机制：**被饿死的永远是队尾那几张**。
      */
     private val fallbackSlots = Semaphore(12)
 
     /**
-     * **并发竞速**的独立槽位。
+     * **可见页**的并发竞速槽位。
      *
-     * 与 [fallbackSlots] 分开的理由：两者是不同性质的占用。
-     * - 串行遍历：一个名额 = 一张图（持续时间长，要等每发请求收尾）；
-     * - 竞速：一个名额 = 一条连接（持续时间短，谁先回来就撤）。
-     * 混用会让"一屏十张图同时换源"与"其中一张在竞速"互相挤压。
+     * 与 [prefetchRaceSlots] 分开的理由见那里的说明：可见页是用户正在等的，
+     * 预载是锦上添花，两者混在一个池子里必然出现"预载把用户的页挤住"。
      *
-     * 取 24：一次竞速最多 7 条并发（候选域名数），24 允许 3 张图同时竞速
-     * 而不互相排队，又给真正的总并发（`IMAGE_MAX_REQUESTS_PER_HOST = 64`）
-     * 留出余量。
+     * 取 16：本网络环境下健康域名通常只有 2 个（diwodiwo / tipatipa），
+     * 一次竞速只占 2 个名额，16 足够 8 张可见页同时换源。
      */
-    private val raceSlots = Semaphore(24)
+    private val raceSlots = Semaphore(16)
+
+    /**
+     * **预载**的并发竞速槽位。
+     *
+     * 为什么必须与可见页分开：阅读器的预载窗口最多 16 页，翻页时会**同时**
+     * 发起十几张图的换源。若与可见页共用一个池子，预载会先于可见页把额度占满
+     * （预载由 `PreloadQueue` 在视口变化时批量提交，通常比用户翻到那一页更早），
+     * 用户翻到的第 18–20 页就只能排队等 —— 这正是"某几页又出问题"的机制。
+     *
+     * 取 6：预载可以慢一点（它不在关键路径上），但要保证"下一屏确实在被准备"。
+     * 6 个名额 × 2 个健康域名 = 同时 3 张预载图在换源，配合 5 分钟的磁盘缓存
+     * 与自适应预载窗口，足够在用户翻到之前把图备好。
+     */
+    private val prefetchRaceSlots = Semaphore(6)
 
     /**
      * 判断是否小图。
@@ -342,6 +352,8 @@ class DomainFallbackInterceptor(
                             // 串行槽位：一个名额代表"这一张图"，与并发竞速的
                             // "一条连接"分开计，避免遍历 7 个候选时把竞速额度也吃掉。
                             sequential = true,
+                            // 预载与可见页各自独立：预载不能占着用户正等的那些页的额度。
+                            prefetch = diskPreload,
                         )
                         if (fallbackResult != null) {
                             rememberWinner(candidateHost)
@@ -375,6 +387,7 @@ class DomainFallbackInterceptor(
                 httpUrl,
                 failedHost,
                 sequential = diskPreload || !isManaged,
+                prefetch = diskPreload,
             )
         }
         // Keep observing the primary while mirrors run. Previously a completed primary
@@ -394,6 +407,7 @@ class DomainFallbackInterceptor(
         httpUrl: HttpUrl,
         failedHost: String,
         sequential: Boolean,
+        prefetch: Boolean,
     ): ImageResult? {
         val fallbackHosts = ImageHosts.imageHosts.filter { it != failedHost }
         if (fallbackHosts.isEmpty()) return null
@@ -405,7 +419,9 @@ class DomainFallbackInterceptor(
             logger.debug { "尝试已知最优域名（快速通道）: $currentOptimal" }
             // 快速通道是单发请求（不并发），走串行槽位：它和"串行遍历"一样，
             // 一个名额代表一张图，持续时间是整个下载过程。
-            val fastResult = tryFallbackHost(chain, httpUrl, currentOptimal, sequential = true)
+            val fastResult = tryFallbackHost(
+                chain, httpUrl, currentOptimal, sequential = true, prefetch = prefetch,
+            )
             if (fastResult != null) {
                 logger.info { "快速通道命中: $currentOptimal" }
                 rememberWinner(currentOptimal)
@@ -431,7 +447,9 @@ class DomainFallbackInterceptor(
                 hostsToRace.sortedBy { scoreCandidateHost(it) }
             )
             for (host in ordered) {
-                val result = tryFallbackHost(chain, httpUrl, host, sequential = true) ?: continue
+                val result = tryFallbackHost(
+                    chain, httpUrl, host, sequential = true, prefetch = prefetch,
+                ) ?: continue
                 rememberWinner(host)
                 return result
             }
@@ -439,7 +457,7 @@ class DomainFallbackInterceptor(
         }
 
         // 策略 2: Race Path (剩余域名通道并发竞速)
-        return raceWithChannel(chain, httpUrl, hostsToRace)
+        return raceWithChannel(chain, httpUrl, hostsToRace, prefetch)
     }
 
     /**
@@ -448,24 +466,69 @@ class DomainFallbackInterceptor(
     private suspend fun raceWithChannel(
         chain: Interceptor.Chain,
         originalHttpUrl: HttpUrl,
-        hostsToRace: List<String>
+        hostsToRace: List<String>,
+        prefetch: Boolean,
     ): SuccessResult? = coroutineScope {
-        // 竞速前先按健康度排序：把死源排后不是为了让它们"不被试"（并发竞速本来
-        // 就都会试到），而是为了让 [raceSlots] 的额度优先留给活源——当 `raceSlots`
-        // 被多张图同时占满时，排在后面的 job 要等前面的协程退出才拿到名额，
-        // 活源排前面意味着"先拿到名额的是有可能成功的那些"。
-        val ordered = hostHealth.orderCandidates(hostsToRace)
-        logger.info { "开始竞速剩余域名: $ordered" }
+        // ---- 关键：把候选分成「健康」与「已隔离」两组 ----
+        //
+        // 为什么必须分组，而不是"排序后一起竞速"：
+        //
+        // 已隔离的域名（国内 DNS 污染的那 6 个 picacomic 系）**必然要等满一次
+        // connectTimeout（3 秒）才失败**。若让它们一起参与竞速，每个死源都会
+        // 占住一个竞速名额整整 3 秒，把额度消耗在"注定失败"的连接上。
+        //
+        // 16 个预载页 × 7 个候选 = 112 条竞速连接，而额度只有十几个 ——
+        // 死源会把额度吃干，导致**真正可能成功的 diwodiwo/tipatipa 反而排不上队**。
+        // 这就是"失败页不断移动"的机制：被饿死的永远是排在额度队尾的那些页。
+        //
+        // 分组后：健康域名（通常只有 2 个）优先竞速，占用极少额度、且能立刻出结果；
+        // 只有在**健康域名全部失败**时，才退回去串行试隔离域名（作为最后兜底，
+        // 保证服务端换节点后仍能取到）。
+        val nowMs = System.currentTimeMillis()
+        val (healthy, quarantined) = hostHealth.partitionByHealth(hostsToRace, nowMs)
 
+        if (healthy.isNotEmpty()) {
+            logger.info { "竞速健康域名: $healthy（已隔离、跳过竞速: $quarantined）" }
+            raceHosts(chain, originalHttpUrl, healthy, prefetch)?.let { return@coroutineScope it }
+            logger.warn { "健康域名竞速全部失败，转入隔离域名兜底: $quarantined" }
+        }
+
+        // 健康域名全灭才走这里。串行（不并发）：隔离域名本来就要各等一次超时，
+        // 并发只是把同一份"注定失败"的成本同时付出去，没有收益。
+        if (quarantined.isEmpty()) return@coroutineScope null
+
+        val fallbackHosts = quarantined.sortedBy { scoreCandidateHost(it) }
+        for (host in fallbackHosts) {
+            val result = tryFallbackHost(
+                chain, originalHttpUrl, host, sequential = true, prefetch = prefetch,
+            ) ?: continue
+            rememberWinner(host)
+            return@coroutineScope result
+        }
+        null
+    }
+
+    /**
+     * 对一组**健康**域名做并发竞速，返回第一个成功结果。
+     *
+     * 与旧实现相比，这里的并发度只等于健康域名数量（本网络环境通常为 2），
+     * 因此额度几乎不会被争抢，一屏十几张图可以同时换源而不互相排队。
+     *
+     * @param prefetch 预载走 [prefetchRaceSlots]，可见页走 [raceSlots]。
+     *   两者分开是"用户正在等的那几页不被预载挤住"的保证。
+     */
+    private suspend fun raceHosts(
+        chain: Interceptor.Chain,
+        originalHttpUrl: HttpUrl,
+        hosts: List<String>,
+        prefetch: Boolean,
+    ): SuccessResult? = coroutineScope {
         val resultChannel = Channel<Pair<String, SuccessResult>>(1)
+        val slots = if (prefetch) prefetchRaceSlots else raceSlots
 
-        val jobs = ordered.map { host ->
+        val jobs = hosts.map { host ->
             launch {
-                // 竞速走独立的 [raceSlots]，不占用串行遍历的 [fallbackSlots]。
-                // 这是本轮的关键修复：原实现两者共用 12 个槽位，一次竞速 7 条
-                // 连接就能吃掉大半，同屏两张图同时换源即把槽位占满，
-                // 后续图片（如第 37/38 页）全部阻塞在 withPermit 上饿死。
-                val result = raceSlots.withPermit {
+                val result = slots.withPermit {
                     withTimeoutOrNull(RACE_TOTAL_TIMEOUT_MS.milliseconds) {
                         withContext(FallbackMarker()) {
                             val newUrl = originalHttpUrl.newBuilder().host(host).build().toString()
@@ -494,7 +557,6 @@ class DomainFallbackInterceptor(
         }
 
         var winnerResult: SuccessResult? = null
-
         for (msg in resultChannel) {
             rememberWinner(msg.first)
             winnerResult = msg.second
@@ -503,10 +565,6 @@ class DomainFallbackInterceptor(
         }
 
         jobs.forEach { it.cancel() }
-
-        if (winnerResult == null) {
-            logger.error { "所有降级域名均竞速失败: $originalHttpUrl" }
-        }
 
         winnerResult
     }
@@ -566,6 +624,9 @@ class DomainFallbackInterceptor(
      *   在多张坏图上不至于无限累积。
      * @param sequential 是否来自串行遍历。true 时占用 [fallbackSlots]（一个名额=一张图），
      *   false 时占用 [raceSlots]（一个名额=一条连接）。两者分开是为了消除槽位争抢。
+     * @param prefetch 是否预载请求。true 时用 [prefetchRaceSlots]，
+     *   与可见页的 [fallbackSlots] / [raceSlots] 完全隔离——
+     *   预载窗口一次会有十几张图同时换源，共用池子必然把用户正看的那几页挤住。
      */
     private suspend fun tryFallbackHost(
         chain: Interceptor.Chain,
@@ -573,11 +634,16 @@ class DomainFallbackInterceptor(
         newHost: String,
         timeoutMs: Long = FALLBACK_TOTAL_TIMEOUT_MS,
         sequential: Boolean = false,
+        prefetch: Boolean = false,
     ): SuccessResult? {
         val newUrl = originalUrl.newBuilder().host(newHost).build().toString()
         val newRequest = chain.request.newBuilder().data(newUrl).build()
 
-        val slots = if (sequential) fallbackSlots else raceSlots
+        val slots = when {
+            prefetch -> prefetchRaceSlots
+            sequential -> fallbackSlots
+            else -> raceSlots
+        }
         return try {
             slots.withPermit {
                 withTimeoutOrNull(timeoutMs.milliseconds) {

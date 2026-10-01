@@ -77,6 +77,17 @@ class ImageConnectionWarmup @Inject constructor(
      *
      * 取延迟最小的那个：不同源在同一网络下主要差的就是握手 + 首字节这一段，
      * 与"下载整张图的快慢"方向一致（实测 diwodiwo 既是 DNS/TLS 最快，也是吞吐最高）。
+     *
+     * ## 只有"确实取到了 HTTP 响应"才做选举
+     *
+     * 用 HEAD 打根路径时，200/403/404 都说明**这个源能连上**（此前注释也承认
+     * "服务端返回 403/404 都无所谓"）。因此不能拿 `execute()` 是否抛异常当判据——
+     * 只要不抛就证明连接可用，可以参与选路。
+     *
+     * 反过来，**一个都没探通时绝不能 `remember`**：那通常意味着本机网络还没就绪
+     * （刚启动、DNS 仍在解析、Wi-Fi 刚连上），此时若把某个源记成"最快"，
+     * 后续每张图都会被 [PreferredHostInterceptor] 改写到它上面，形成新的故障。
+     * 旧实现在这里返回 null 且不写记录，是正确行为，保留。
      */
     private suspend fun electFastestHost(): String? {
         val winner = supervisorScope {

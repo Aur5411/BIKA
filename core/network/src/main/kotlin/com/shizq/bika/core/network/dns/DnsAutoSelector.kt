@@ -178,12 +178,26 @@ class DnsAutoSelector @Inject internal constructor(
                 .map { it.await() }
         }
 
+    /**
+     * 出厂兜底候选。
+     *
+     * 不再只用单个 [DnsPreferences.DEFAULT_DNS_IP]，而是把整个
+     * [BootstrapDnsIps] 池都放进来。理由：兜底候选是"线路接口与历史快照都拿不到
+     * IP 时"唯一还能指望的东西（典型是首次冷启动、或 DNS 服务暂时不可用），
+     * 只给一个 IP 时它一旦在当前网络不可达，整轮优选就全军覆没、直接放弃写入，
+     * 用户只能一直用那个坏 IP。给一组则只要有一个通，本轮优选就能正常收敛。
+     */
     private fun factoryFallbackHosts(): List<ResolvedDnsHost> {
-        val ip = DnsPreferences.DEFAULT_DNS_IP
-        return listOf(
-            ResolvedDnsHost(ip, DnsPreferences.DEFAULT_DNS_LINE, BikaDnsDomains.API),
-            ResolvedDnsHost(ip, DnsPreferences.DEFAULT_DNS_LINE, BikaDnsDomains.IMAGE),
-        )
+        val ips = BootstrapDnsIps.BOOTSTRAP_IP_STRINGS
+        val preferred = DnsPreferences.DEFAULT_DNS_IP
+        // 把历史默认 IP 放最前面：它在多数环境下已被验证可用，让它优先参与竞速。
+        val ordered = (listOf(preferred) + ips).distinct()
+        return ordered.flatMap { ip ->
+            listOf(
+                ResolvedDnsHost(ip, DnsPreferences.DEFAULT_DNS_LINE, BikaDnsDomains.API),
+                ResolvedDnsHost(ip, DnsPreferences.DEFAULT_DNS_LINE, BikaDnsDomains.IMAGE),
+            )
+        }
     }
 }
 
