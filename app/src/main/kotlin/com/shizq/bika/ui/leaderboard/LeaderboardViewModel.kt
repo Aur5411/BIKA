@@ -10,6 +10,7 @@ import com.shizq.bika.core.data.repository.LeaderboardRepository
 import com.shizq.bika.core.database.dao.ReadingHistoryDao
 import com.shizq.bika.core.datastore.UserPreferencesDataSource
 import com.shizq.bika.core.model.ComicSummary
+import com.shizq.bika.core.model.matchesBlockedTags
 import com.shizq.bika.core.result.Result
 import com.shizq.bika.core.result.asResult
 import com.shizq.bika.util.injectLocalStatusFrom
@@ -71,17 +72,11 @@ class LeaderboardViewModel @Inject constructor(
                 monthly.filter { comic -> prefs.filter.globalBlockedTopics.none { it in comic.categories } }
             } else monthly
 
-        val finalDaily = if (prefs.filter.blockedTags.isNotEmpty()) {
-            filteredDaily.filter { comic -> comic.tags.none { it in prefs.filter.blockedTags } }
-        } else filteredDaily
+        val finalDaily = filteredDaily.filterNot { it.matchesBlockedTags(prefs.filter.blockedTags) }
 
-        val finalWeekly = if (prefs.filter.blockedTags.isNotEmpty()) {
-            filteredWeekly.filter { comic -> comic.tags.none { it in prefs.filter.blockedTags } }
-        } else filteredWeekly
+        val finalWeekly = filteredWeekly.filterNot { it.matchesBlockedTags(prefs.filter.blockedTags) }
 
-        val finalMonthly = if (prefs.filter.blockedTags.isNotEmpty()) {
-            filteredMonthly.filter { comic -> comic.tags.none { it in prefs.filter.blockedTags } }
-        } else filteredMonthly
+        val finalMonthly = filteredMonthly.filterNot { it.matchesBlockedTags(prefs.filter.blockedTags) }
 
         AllLeaderboards(
             dailyComics = finalDaily,

@@ -77,6 +77,17 @@ private const val EPISODE_PAGE_RETRY_JITTER_MS = 250L
 private const val COMPLETE_CATALOG_TIMEOUT_MS = 30_000L
 
 /**
+ * 目录流整次拉取失败后的最大重试次数（不含首次）。
+ *
+ * shareIn 的 upstream 正常完成后永不重启，所以"零页成功"必须在 upstream 内部
+ * 自愈——否则 Empty 会被 replay 永久缓存，上下章按钮直到杀进程都是灰的。
+ */
+private const val CATALOG_FLOW_MAX_ATTEMPTS = 3
+
+/** 目录流重试的基准退避间隔，按尝试次数线性放大（2s → 4s → 6s）。 */
+private const val CATALOG_FLOW_RETRY_BASE_DELAY_MS = 2_000L
+
+/**
  * 完整目录的内存缓存有效期。
  *
  * 章节列表在几分钟内基本不会变，而用户"看详情 → 进阅读器 → 返回详情"是很常见的
@@ -128,41 +139,54 @@ class ChapterRepositoryImpl @Inject constructor(
     override fun getChapterCatalog(comicId: String): Flow<ChapterCatalog> =
         catalogCache.getOrPut(comicId) {
             flow {
-                val collected = mutableListOf<Chapter>()
-                var emittedAny = false
+                // 详情页刚拉过完整目录时立即先发快照：阅读器的上下章按钮零等待可用，
+                // 不必等目录流重新走一遍网络。快照过期与否都发——过期的也比 Empty 强，
+                // 后续的完整拉取会立刻覆盖它。
+                completeCatalogCache[comicId]?.let { emit(it.catalog) }
 
-                walkEpisodePages(
-                    comicId = comicId,
-                    onPage = { chapters, isLastPage, declaredTotal ->
-                        collected += chapters
-                        emittedAny = true
-                        // isComplete 直接取"是否末页"：因页数上限或中途失败停下时
-                        // 这个值是 false，导航据此知道边界不可信。
-                        // declaredTotal 第一页就有，所以上下章导航从第一次发射起就可用，
-                        // 不用等整本目录拉完
-                        emit(
-                            ChapterCatalog(
-                                chapters = collected.sortedBy { it.order },
-                                isComplete = isLastPage,
-                                declaredTotal = declaredTotal,
+                var attempts = 0
+                while (true) {
+                    val collected = mutableListOf<Chapter>()
+                    var emittedAny = false
+
+                    walkEpisodePages(
+                        comicId = comicId,
+                        onPage = { chapters, isLastPage, declaredTotal ->
+                            collected += chapters
+                            emittedAny = true
+                            emit(
+                                ChapterCatalog(
+                                    chapters = collected.sortedBy { it.order },
+                                    isComplete = isLastPage,
+                                    declaredTotal = declaredTotal,
+                                )
+                                    .fillMissingLeadingOrders(declaredTotal)
                             )
-                                // 与目录页同一套补齐规则：服务端把长目录截断（160 话只给 90 话）时
-                                // 按 order 补出缺失的前置章节，阅读器的章节列表与上下章导航
-                                // 才和目录页看到的一致
-                                .fillMissingLeadingOrders(declaredTotal)
-                        )
-                    },
-                    // 中途失败保留已拉到的部分：若由下游 catch 统一 emit(Empty)，
-                    // 第 3 页失败会把前 2 页已经交出去的目录清空，
-                    // 上下章导航从"知道一部分"退化成"什么都不知道"
-                    onPageError = { page, e ->
-                        logger.warn(e) { "章节目录第 $page 页失败，保留已拉取部分 comic=$comicId" }
-                    },
-                )
+                        },
+                        onPageError = { page, e ->
+                            logger.warn(e) { "章节目录第 $page 页失败，保留已拉取部分 comic=$comicId" }
+                        },
+                    )
 
-                // 连第一页都没成功：一条都没发过，下游会一直等在初始值上
-                if (!emittedAny) {
-                    emit(ChapterCatalog.Empty)
+                    // 拉到了数据（哪怕部分）就结束：部分目录的导航也可用，
+                    // 无限重试反而让"已知范围"迟迟不出现。
+                    if (emittedAny) break
+
+                    // 一页都没成功——这里曾直接 emit(Empty) 结束 upstream，是个
+                    // 严重缺陷：shareIn 的 upstream **正常完成后永不重启**
+                    // （WhileSubscribed 只会重启"被取消"的上游，不会重启"已完成"的），
+                    // 于是 Empty 被 replay=1 永久缓存，此后每次进这部漫画的阅读器，
+                    // 上下章按钮都一直是灰的，直到杀进程。现在改为内部退避重试，
+                    // 重试耗尽才 emit Empty。
+                    attempts++
+                    if (attempts >= CATALOG_FLOW_MAX_ATTEMPTS) {
+                        logger.warn { "章节目录 comic=$comicId 连续 $attempts 次拉取全部失败，放弃本次" }
+                        emit(ChapterCatalog.Empty)
+                        break
+                    }
+                    val delayMs = CATALOG_FLOW_RETRY_BASE_DELAY_MS * attempts
+                    logger.info { "章节目录 comic=$comicId 拉取失败（第 $attempts 次），${delayMs}ms 后重试" }
+                    delay(delayMs)
                 }
             }
                 .shareIn(scope, SharingStarted.WhileSubscribed(30_000), replay = 1)

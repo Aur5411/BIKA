@@ -17,6 +17,7 @@ import com.shizq.bika.core.domain.filter.matchesFilters
 import com.shizq.bika.core.domain.filter.toggle
 import com.shizq.bika.core.model.ComicSummary
 import com.shizq.bika.core.model.FavoriteTag
+import com.shizq.bika.core.model.matchesBlockedTags
 import com.shizq.bika.core.model.SortOrder
 import com.shizq.bika.core.network.BikaDataSource
 import com.shizq.bika.navigation.DiscoveryAction
@@ -125,7 +126,9 @@ class FeedViewModel @AssistedInject constructor(
             if (state.blockedTags.isEmpty()) {
                 step1
             } else {
-                step1.pagingFilter { comic -> comic.tags.none { it in state.blockedTags } }
+                // 归一化匹配（忽略大小写/首尾空格）：精确比较会让服务端标签的
+                // 大小写变体漏网，用户看到的就是"有的屏蔽了还在"
+                step1.pagingFilter { comic -> !comic.matchesBlockedTags(state.blockedTags) }
             }
         }
     }.cachedIn(viewModelScope)
