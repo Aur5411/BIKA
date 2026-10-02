@@ -34,6 +34,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
@@ -129,10 +130,18 @@ class ReaderViewModel @AssistedInject constructor(
     // （重新 getChapterPages → 重新订阅），这才是真正意义上的重载。
     private val retrySignal = MutableStateFlow(0)
 
-    private val chapterPagesKeyFlow = stateMachine.state
-        .filterIsInstance<ReaderUiState.Ready>()
-        .map { state -> Triple(state.chapter.order, state.chapter.initialPage, retrySignal.value) }
-        .distinctUntilChanged()
+    // key 的组装必须用 combine 把 retrySignal 作为**真正的流依赖**并进来。
+    // 旧写法在 map 的 lambda 里读 `retrySignal.value`——那只在上游（state）恰好
+    // 发射时才求值，reloadChapterPages() 单独自增 retrySignal 时 state 没有变化，
+    // 这条流不会发射，distinctUntilChanged 之后什么都不会发生：
+    // "重新加载当前章节的分页数据"从未真正工作过。跳章后图片流若恰好处于
+    // 失败态，用户点重试就永远是没反应——这是「上下章失效」观感的另一个来源。
+    private val chapterPagesKeyFlow = combine(
+        stateMachine.state.filterIsInstance<ReaderUiState.Ready>(),
+        retrySignal,
+    ) { state, retry ->
+        Triple(state.chapter.order, state.chapter.initialPage, retry)
+    }.distinctUntilChanged()
 
     private val chapterPagesResultFlow = chapterPagesKeyFlow
         .map { (chapterOrder, initialPage, _) ->

@@ -3,7 +3,6 @@ package com.shizq.bika.core.data.repository
 import androidx.paging.Pager
 import androidx.paging.PagingConfig
 import androidx.paging.PagingData
-import com.shizq.bika.core.coroutine.ApplicationScope
 import com.shizq.bika.core.data.model.Chapter
 import com.shizq.bika.core.data.model.ChapterCatalog
 import com.shizq.bika.core.data.model.asExternalModel
@@ -23,7 +22,6 @@ import com.shizq.bika.core.network.model.estimateLastChapterPage
 import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -33,7 +31,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -102,7 +99,6 @@ class ChapterRepositoryImpl @Inject constructor(
     private val chapterListPagingSourceFactory: ChapterListPagingSource.Factory,
     private val chapterPagesPagingSourceFactory: ChapterPagesPagingSource.Factory,
     private val network: BikaDataSource,
-    @ApplicationScope private val scope: CoroutineScope,
 ) : ChapterRepository {
     private val catalogCache = ConcurrentHashMap<String, Flow<ChapterCatalog>>()
 
@@ -189,7 +185,19 @@ class ChapterRepositoryImpl @Inject constructor(
                     delay(delayMs)
                 }
             }
-                .shareIn(scope, SharingStarted.WhileSubscribed(30_000), replay = 1)
+            // 刻意**不用** shareIn/WhileSubscribed 缓存这个流。
+            //
+            // 旧实现是 `flow{...}.shareIn(scope, WhileSubscribed(30_000), replay=1)`，
+            // 有一个致命语义：shareIn 的 upstream **正常完成后永不重启**——
+            // WhileSubscribed 只会重启"被取消"的上游，不会重启"已完成"的。
+            // 于是首次拉取一页未成时 emit 的 Empty 会被 replay=1 永久缓存，
+            // 这部漫画的阅读器从此目录永远为空：上下章按钮全灰、
+            // （当时的）章末自动衔接也永远不触发，直到杀进程。
+            //
+            // 现在是冷流：每个收集者（每次进阅读器新建 ReaderViewModel）都完整重跑
+            // ——快照先行（详情页刚拉过就零等待），失败内部重试。代价只是每次进
+            // 阅读器重拉一遍目录（最多 60 页、并发 5，约 2~3 秒），换来的是
+            // "失败后重进就重试"这一条最重要的自愈性质。
         }
 
     /**

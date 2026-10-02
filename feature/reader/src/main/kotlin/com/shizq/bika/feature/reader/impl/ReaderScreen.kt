@@ -69,7 +69,6 @@ import com.shizq.bika.feature.reader.impl.state.ReaderAction.ToggleBarsVisibilit
 import com.shizq.bika.feature.reader.impl.state.ReaderSheet
 import com.shizq.bika.feature.reader.impl.state.ReaderUiState
 import com.shizq.bika.feature.reader.impl.system.ReaderSystemEffects
-import com.shizq.bika.feature.reader.impl.util.ChapterAdvancePolicy
 import com.shizq.bika.feature.reader.impl.util.ScrubState
 import com.shizq.bika.feature.reader.impl.util.preload.ChapterPagePreloadProvider
 import com.shizq.bika.feature.reader.impl.util.preload.PagingPreload
@@ -198,20 +197,6 @@ private fun ReaderReadyContent(
 
     // TODO: 暂时移除
 //            BackHandler(onBack = onBackClick)
-
-    ChapterAutoAdvanceEffect(
-        chapterOrder = chapterState.order,
-        totalPages = chapterState.totalPages,
-        controller = controller,
-        navigation = navigation,
-        onAdvance = { nextChapter, page ->
-            dispatch(JumpToChapter(nextChapter, startFromBeginning = true, currentPage = page))
-        },
-        // todo 替换成 MessageReporter
-        onNoMoreContent = {
-            Toast.makeText(context, ReaderScreenMessages.NoMoreContent, Toast.LENGTH_SHORT).show()
-        },
-    )
 
     val preloadCount = rememberAdaptivePreloadCount(
         currentPage = currentPage,
@@ -358,48 +343,9 @@ private object ReaderScreenMessages {
 }
 
 /**
- * 章节自动衔接：到达当前章节最后一页时自动跳转到下一章；已是最后一章则回调 [onNoMoreContent]。
- *
- * 用 totalPages 作为 key 而非 snapshotFlow { totalPages }：totalPages 不是 Compose State，
- * snapshotFlow 无依赖可订阅，初始为 0 时 first() 会永久挂起。改为 key 后，totalPages 从 0
- * 变为非零值会触发 recomposition 重启这个 effect，天然实现“等待章节加载完成后再监听”。
+ * 章节自动衔接效果已按用户要求移除（2026-10-03）：读到章节末尾不再自动跳入下一章。
+ * 章间切换只保留手动入口——底栏「上一章 / 下一章」按钮与侧边目录。
  */
-@Composable
-private fun ChapterAutoAdvanceEffect(
-    chapterOrder: Int,
-    totalPages: Int,
-    controller: ReaderController,
-    navigation: ChapterNavigation,
-    onAdvance: (nextChapter: Chapter, page: Int) -> Unit,
-    onNoMoreContent: () -> Unit,
-    policy: ChapterAdvancePolicy = remember { ChapterAdvancePolicy() },
-) {
-    val nextChapter = navigation.next
-    LaunchedEffect(chapterOrder, totalPages, nextChapter, controller) {
-        if (totalPages <= 0) return@LaunchedEffect
-        // 末页判定必须用 forEndOfChapter（当前屏的**最后**一页）。
-        //
-        // 用起始页会让跨页模式永远读不完一章：10 页分成 D(0,1)…D(8,9)，末屏的
-        // 起始页恒为 8，isAtLastPage(8, 10) 判 8 >= 9 为假 —— 自动衔接不触发、
-        // 「已读完」标记拿不到、页码徽章停在 9/10。
-        controller.positionFlow()
-            .map { it.forEndOfChapter }
-            .distinctUntilChanged()
-            .debounce(policy.endOfChapterDebounce)
-            .collect { page ->
-                if (policy.isAtLastPage(page, totalPages)) {
-                    delay(policy.advanceDelay)
-                    if (nextChapter != null) {
-                        // 自动跳转下一章，从头开始阅读，不恢复该章历史进度
-                        onAdvance(nextChapter, page)
-                    } else {
-                        onNoMoreContent()
-                    }
-                }
-            }
-    }
-}
-
 @Composable
 private fun ReaderBottomBarSection(
     currentPage: Int,
