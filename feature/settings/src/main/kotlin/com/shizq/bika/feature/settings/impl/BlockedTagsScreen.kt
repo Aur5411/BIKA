@@ -47,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.shizq.bika.core.model.normalizedTag
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
@@ -132,7 +133,10 @@ fun BlockedTagsScreen(
                     onClick = {
                         val tagToAdd = inputTag.trim()
                         if (tagToAdd.isNotEmpty()) {
-                            if (blockedTags.contains(tagToAdd)) {
+                            // 判重必须和匹配用同一套归一化规则：否则先加"冒险"、
+                            // 再加" 冒险"会被当成两个不同的词，屏蔽列表里出现重复项，
+                            // 界面上看着像"屏蔽了两次"。
+                            if (blockedTags.any { it.normalizedTag() == tagToAdd.normalizedTag() }) {
                                 Toast.makeText(
                                     context,
                                     "该标签已存在于屏蔽列表中",

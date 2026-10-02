@@ -12,4 +12,6 @@ dependencies {
     api(libs.kotlinx.datetime)
 
     implementation(libs.kotlinx.serialization.core)
+
+    testImplementation(libs.kotlin.test.junit)
 }

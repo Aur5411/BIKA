@@ -12,9 +12,19 @@ package com.shizq.bika.core.model
  */
 fun String.normalizedTag(): String = trim().lowercase()
 
-/** 该漫画的标签里是否有任何一个命中屏蔽列表（归一化后比较）。 */
+/**
+ * 该漫画是否命中屏蔽列表。
+ *
+ * **必须同时看 [ComicSummary.tags] 和 [ComicSummary.categories]**：
+ * 详情页把两者合并成一片标签云展示（`detail.tags + detail.categories`），
+ * 也允许长按其中任意一个加入屏蔽列表。所以用户从详情页屏蔽"百合""校园"
+ * 这类词时，屏蔽的其实是 [categories] 里的值——只匹配 [tags] 会让这些屏蔽
+ * 条目永远不命中，表现就是"屏蔽了还在列表里"。
+ */
 fun ComicSummary.matchesBlockedTags(blockedTags: Set<String>): Boolean {
     if (blockedTags.isEmpty()) return false
     val blocked = blockedTags.map { it.normalizedTag() }.toSet()
-    return tags.any { it.normalizedTag() in blocked }
+    if (blocked.isEmpty()) return false
+    return tags.any { it.normalizedTag() in blocked } ||
+            categories.any { it.normalizedTag() in blocked }
 }

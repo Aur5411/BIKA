@@ -1,6 +1,7 @@
 package com.shizq.bika.feature.comicdetail.impl
 
 import androidx.compose.runtime.Immutable
+import com.shizq.bika.core.model.normalizedTag
 import com.shizq.bika.core.network.model.ComicData
 import com.shizq.bika.core.network.model.ComicData.Comic.Creator
 import com.shizq.bika.core.network.model.RecommendComicDto
@@ -69,7 +70,11 @@ data class ComicSummary(
     val id: String,
     val title: String,
     val coverUrl: String,
-    val author: String
+    val author: String,
+    // 推荐接口（RecommendComicDto）只返回 categories、不返回 tags。
+    // 之前这里不接 categories，导致详情页推荐位在结构上无法按屏蔽词过滤——
+    // 只能改标题/作者来匹配，屏蔽词几乎永远命中不了。
+    val categories: List<String> = emptyList(),
 )
 
 fun RecommendComicDto.toComicSummary(): ComicSummary {
@@ -77,10 +82,25 @@ fun RecommendComicDto.toComicSummary(): ComicSummary {
         id = id,
         title = title,
         coverUrl = thumb.originalImageUrl,
-        author = author
+        author = author,
+        categories = categories,
     )
 }
 
 fun RecommendationData.toComicSummaryList(): List<ComicSummary> {
     return this.comics.map { it.toComicSummary() }
+}
+
+/**
+ * 推荐位是否命中屏蔽列表。
+ *
+ * 推荐接口只返回 categories（见 [RecommendComicDto]），所以这里只看 categories。
+ * 归一化规则与 `core.model` 里列表页用的完全一致（去首尾空格 + 忽略大小写），
+ * 否则同一个屏蔽词在列表页生效、在推荐页不生效，用户会以为"屏蔽时灵时不灵"。
+ */
+fun ComicSummary.matchesBlockedTags(blockedTags: Set<String>): Boolean {
+    if (blockedTags.isEmpty()) return false
+    val blocked = blockedTags.map { it.normalizedTag() }.toSet()
+    if (blocked.isEmpty()) return false
+    return categories.any { it.normalizedTag() in blocked }
 }

@@ -7,6 +7,7 @@ import com.freeletics.flowredux2.FlowReduxStateMachineFactory
 import com.freeletics.flowredux2.initializeWith
 import com.shizq.bika.core.database.dao.ReadingHistoryDao
 import com.shizq.bika.core.database.model.ReadingHistoryEntity
+import com.shizq.bika.core.datastore.UserPreferencesDataSource
 import com.shizq.bika.core.network.BikaDataSource
 import com.shizq.bika.core.network.model.ActionData
 import com.shizq.bika.core.network.runCatchingApi
@@ -14,6 +15,7 @@ import com.shizq.bika.feature.comicdetail.impl.ComicDetail
 import com.shizq.bika.feature.comicdetail.impl.ComicSummary
 import com.shizq.bika.feature.comicdetail.impl.UnitedDetailsAction
 import com.shizq.bika.feature.comicdetail.impl.UnitedDetailsUiState
+import com.shizq.bika.feature.comicdetail.impl.matchesBlockedTags
 import com.shizq.bika.feature.comicdetail.impl.toComicDetail
 import com.shizq.bika.feature.comicdetail.impl.toComicSummaryList
 import dagger.assisted.Assisted
@@ -21,12 +23,14 @@ import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Clock
 
 class UnitedDetailsStateMachine @AssistedInject constructor(
     private val network: BikaDataSource,
     private val historyDao: ReadingHistoryDao,
+    private val preferences: UserPreferencesDataSource,
     // 原名 id：与"评论 id"在状态机和 ViewModel 里同名同类型，传错编译器不拦
     @Assisted private val comicId: String,
 ) : FlowReduxStateMachineFactory<UnitedDetailsUiState, UnitedDetailsAction>() {
@@ -164,6 +168,19 @@ class UnitedDetailsStateMachine @AssistedInject constructor(
     } catch (e: Exception) {
         Log.w(TAG, "Recommendations unavailable; detail page stays visible without them", e)
         emptyList()
+    }.filterNot { summary -> summary.matchesBlockedTags(blockedTags()) }
+
+    /**
+     * 当前屏蔽列表。取不到（DataStore 首次读异常）时按"没屏蔽任何东西"处理，
+     * 推荐位宁可多显示，也不要因为读偏好失败而整块消失。
+     */
+    private suspend fun blockedTags(): Set<String> = try {
+        preferences.userData.first().filter.blockedTags
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(TAG, "Reading blocked tags failed; recommendations stay unfiltered", e)
+        emptySet()
     }
 
     @AssistedFactory
