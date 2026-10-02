@@ -8,7 +8,9 @@ import com.shizq.bika.core.data.model.Chapter
 import com.shizq.bika.core.data.model.ChapterCatalog
 import com.shizq.bika.core.data.model.asExternalModel
 import com.shizq.bika.core.data.model.fillMissingLeadingOrders
+import com.shizq.bika.core.data.paging.CATALOG_TERMINAL_PROBE_PAGES
 import com.shizq.bika.core.data.paging.ChapterListPagingSource
+import com.shizq.bika.core.data.paging.chapterCatalogWalkDecision
 import com.shizq.bika.core.data.paging.ChapterMeta
 import com.shizq.bika.core.data.paging.ChapterPagesPagingSource
 import com.shizq.bika.core.data.paging.CrossPageDeduplicator
@@ -62,22 +64,17 @@ private const val EPISODE_PAGE_RETRY_DELAY_MS = 300L
 private const val EPISODE_PAGE_RETRY_JITTER_MS = 250L
 
 /**
- * 出现空页 / 重复页后，还允许往前探几页。
- *
- * 正常服务端在末页之后返回空页，一次就能确认到底。但对长目录（100 话以上）
- * 实测会出现"中间某页返回空、后面还有数据"和"越界页被 clamp 回上一页"两种情况，
- * 一次就认输会让目录稳定丢掉最老的那几十话。这里给一个很小的探测预算：
- * 真的到底时最多多花 [CATALOG_TERMINAL_PROBE_PAGES] 个请求，代价可忽略。
- */
-private const val CATALOG_TERMINAL_PROBE_PAGES = 3
-
-/**
  * 整份目录的取数时限。
  *
  * 并发之后正常情况几个网络来回就够（120 话约 3 个来回）。超过这个时间说明网络
  * 或服务端确实有问题，继续等只是让用户对着转圈；宁可失败让他点重试。
+ *
+ * 取 30 秒（v1.11.36 从 15 秒放宽）：单页失败重试是 3 次、每次都按 3 秒建连超时
+ * 加退避抖动算，最坏一批就要 10 秒上下；慢网络下两批就能把 15 秒耗光，
+ * 而目录页对"结论"的要求只是**最终判负**——过程里每个批次都已经在渐进渲染，
+ * 放宽超时只是让慢网络下的用户等得到结论，而不是中途被判死。
  */
-private const val COMPLETE_CATALOG_TIMEOUT_MS = 15_000L
+private const val COMPLETE_CATALOG_TIMEOUT_MS = 30_000L
 
 /**
  * 完整目录的内存缓存有效期。
@@ -398,27 +395,40 @@ class ChapterRepositoryImpl @Inject constructor(
                 val chapters = deduplicator.retainUnseen(page, eps.docs.map { it.asExternalModel() })
                 loaded += chapters.size
 
-                // 空页 / 重复页原本就是终止信号，但只有在"没有理由认为还有数据"时才作数。
-                // 服务端自报 total=160 而我们只拿到 90 条，说明后面一定还有——
-                // 这时把终止信号当结论就会稳定丢掉最老的那几十话
-                val shortOfExpected = expectedTotal > 0 && loaded < expectedTotal
-                val terminalSignal = isEmptyPage || pageRepeated
-                val skipTerminalSignal = terminalSignal && shortOfExpected && terminalProbesLeft > 0
+                // 终止判定收敛到纯函数（见 chapterCatalogWalkDecision 的 KDoc）。
+                // v1.11.36 两处修复都在这个函数里：
+                // 1) "非空但零新章节"也算终止信号——服务端把越界页 clamp 到任意
+                //    已见页（不一定是紧邻上一页）时，旧判定认不出来，
+                //    遍历会对着同样的数据一路翻到页数上限，目录停在一半；
+                // 2) 探测中收到新章节就把预算重置回满额——空页与数据页交替时
+                //    旧实现会把 3 次预算逐步耗尽，照样提前终止丢话。
+                val decision = chapterCatalogWalkDecision(
+                    isEmptyPage = isEmptyPage,
+                    pageRepeated = pageRepeated,
+                    pageHasNewChapters = chapters.isNotEmpty(),
+                    loaded = loaded,
+                    expectedTotal = expectedTotal,
+                    probesLeft = terminalProbesLeft,
+                )
+                terminalProbesLeft = decision.probesLeft
 
                 logger.info {
                     "章节目录 comic=$comicId 第 $page 页：收到 ${eps.docs.size} 条，累计 $loaded 条" +
                             "（服务端返回 page=${eps.page} total=${eps.total} pages=${eps.pages}" +
                             " limit=${eps.limit}，首条 order=${eps.docs.firstOrNull()?.order}）" +
                             when {
-                                skipTerminalSignal -> " → 判为可疑终止信号，继续往后探"
-                                terminalSignal -> " → 结束"
+                                decision.isSuspicious -> " → 判为可疑终止信号，继续往后探"
+                                decision.isTerminal -> " → 结束"
                                 else -> ""
                             }
                 }
 
-                if (skipTerminalSignal) {
-                    terminalProbesLeft--
-                    val reason = if (isEmptyPage) "空页" else "与上一页完全相同的页"
+                if (decision.isSuspicious) {
+                    val reason = when {
+                        isEmptyPage -> "空页"
+                        pageRepeated -> "与上一页完全相同的页"
+                        else -> "不含任何新章节的页"
+                    }
                     logger.warn {
                         "章节目录 comic=$comicId 第 $page 页返回$reason，但服务端自报 total=$expectedTotal" +
                                 "、目前只收到 $loaded 条，判定为「还没拉完」，跳过继续探" +
@@ -431,7 +441,7 @@ class ChapterRepositoryImpl @Inject constructor(
                     continue
                 }
 
-                if (eps.total > 0 && loaded >= eps.total && !terminalSignal) {
+                if (eps.total > 0 && loaded >= eps.total && !decision.isTerminal) {
                     // total 说自己齐了但接口还在给数据：以接口为准继续拉，
                     // 只把这种不自洽记下来，便于事后定位服务端问题
                     logger.warn {
@@ -440,7 +450,7 @@ class ChapterRepositoryImpl @Inject constructor(
                     }
                 }
 
-                if (terminalSignal) {
+                if (decision.isTerminal) {
                     // 已经结束，但要区分"确信到底"和"探不动了"：跟服务端自报的总数对不上时
                     // 说明后面大概率还有章节，此时不能把 isComplete 报成 true——
                     // 阅读器的上下章导航就是靠这个标记知道边界不可信的
@@ -451,7 +461,7 @@ class ChapterRepositoryImpl @Inject constructor(
                         logger.warn {
                             "章节目录 comic=$comicId 在 $loaded 条处结束，但服务端自报 total=$expectedTotal：" +
                                     "剩余 ${expectedTotal - loaded} 条未取到，" +
-                                    "疑似服务端在无效页码上返回${if (isEmptyPage) "空页" else "重复页"}"
+                                    "疑似服务端在无效页码上返回了无新数据的页"
                         }
                     }
                     onPage(chapters, confidentEnd, expectedTotal)
